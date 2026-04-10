@@ -85,6 +85,7 @@ CONFIGURABLE_TOOLSETS = [
     ("cronjob",         "⏰ Cron Jobs",                 "create/list/update/pause/resume/run, with optional attached skills"),
     ("rl",              "🧪 RL Training",               "Tinker-Atropos training tools"),
     ("homeassistant",    "🏠 Home Assistant",           "smart home device control"),
+    ("gaming",           "🎮 Game Playing",             "screenshot, click, key via vision + xdotool"),
 ]
 
 # Toolsets that are OFF by default for new installs.
