@@ -5633,6 +5633,12 @@ class AIAgent:
         if self._is_qwen_portal():
             extra_body["vl_high_resolution_images"] = True
 
+        # Gemini Flex inference: 50% cost reduction, best-effort availability.
+        # 503/429 errors from capacity shedding are already retryable.
+        _is_gemini_direct = (self.provider or "").strip().lower() == "gemini"
+        if _is_gemini_direct:
+            extra_body["service_tier"] = "flex"
+
         if extra_body:
             api_kwargs["extra_body"] = extra_body
 
