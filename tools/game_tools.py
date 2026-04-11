@@ -13,11 +13,14 @@ import logging
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
-# Ensure at least one handler so our logs actually appear
-if not logger.handlers and not logging.getLogger().handlers:
-    _handler = logging.StreamHandler()
-    _handler.setLevel(logging.DEBUG)
-    logger.addHandler(_handler)
+
+# The gateway sets stderr to WARNING by default (verbosity=0).
+# Force our own handler at DEBUG so game tool logs always appear.
+_game_handler = logging.StreamHandler()
+_game_handler.setLevel(logging.DEBUG)
+_game_handler.setFormatter(logging.Formatter("%(name)s [%(levelname)s] %(message)s"))
+logger.addHandler(_game_handler)
+logger.propagate = False  # Don't double-log through root's WARNING filter
 
 DISPLAY = os.environ.get("DISPLAY", ":99")
 
@@ -31,6 +34,21 @@ MAX_OBSERVATIONS = 6          # screenshot-analyze cycles per game_turn call
 MAX_ACTIONS_HARD_CAP = 30     # total actions (clicks+keys) per call
 WALL_CLOCK_TIMEOUT = 120      # seconds
 STRATEGIC_REVIEW_INTERVAL = 10  # Pro review every N turns
+
+# xdotool key name normalization — Flash often generates lowercase
+_KEY_NORMALIZE = {
+    "escape": "Escape", "return": "Return", "enter": "Return",
+    "space": "space", "tab": "Tab", "backspace": "BackSpace",
+    "delete": "Delete", "home": "Home", "end": "End",
+    "pageup": "Page_Up", "pagedown": "Page_Down",
+    "up": "Up", "down": "Down", "left": "Left", "right": "Right",
+    "shift+return": "Shift+Return", "shift+enter": "Shift+Return",
+}
+
+
+def _normalize_key(key):
+    """Normalize key names to xdotool format."""
+    return _KEY_NORMALIZE.get(key.lower().strip(), key)
 
 ESCALATION_KEYWORDS = [
     "enemy", "barbarian", "attack", "war", "declare",
@@ -338,7 +356,7 @@ def _execute_action(action, full_w, full_h):
         return {"status": "pressed", "key": "Shift+Return"}
 
     if act_type == "key":
-        key = action.get("key", "")
+        key = _normalize_key(action.get("key", ""))
         if not key:
             return {"status": "error", "error": "no key specified"}
         _focus_game_window()
@@ -365,7 +383,7 @@ def _execute_ui_action(action, full_w, full_h, window_name=None):
     act_type = action.get("action", "")
 
     if act_type == "key":
-        key = action.get("key", "")
+        key = _normalize_key(action.get("key", ""))
         if not key:
             return {"status": "error", "error": "no key specified"}
         _focus_window(window_name)
@@ -1452,7 +1470,7 @@ def game_key(args: dict, **kwargs) -> str:
     "space" for wait, "x" for auto-explore).
     """
     import time
-    key = args.get("key", "")
+    key = _normalize_key(args.get("key", ""))
     if not key:
         return json.dumps({"status": "error", "error": "key is required"})
 
