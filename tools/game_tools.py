@@ -73,10 +73,12 @@ def _focus_game_window():
 
 
 def _capture_and_downscale(target_w=None, target_h=None):
-    """Capture screenshot at full res, downscale for vision, return (b64, full_w, full_h)."""
-    tw, th = target_w or DEFAULT_DOWNSCALE[0], target_h or DEFAULT_DOWNSCALE[1]
+    """Capture screenshot, return (b64, full_w, full_h).
+
+    Sends full resolution (1920x1080) to give vision models maximum detail
+    for UI element identification. The name is kept for backward compat.
+    """
     path_full = tempfile.mktemp(suffix=".png")
-    path_small = tempfile.mktemp(suffix="_small.png")
     try:
         subprocess.run(
             ["import", "-display", DISPLAY, "-window", "root", path_full],
@@ -88,19 +90,14 @@ def _capture_and_downscale(target_w=None, target_h=None):
         )
         full_w, full_h = map(int, result.stdout.strip().split())
 
-        subprocess.run(
-            ["convert", path_full, "-resize", f"{tw}x{th}", path_small],
-            check=True,
-        )
-        with open(path_small, "rb") as f:
+        with open(path_full, "rb") as f:
             img_b64 = base64.b64encode(f.read()).decode()
         return img_b64, full_w, full_h
     finally:
-        for p in (path_full, path_small):
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+        try:
+            os.unlink(path_full)
+        except OSError:
+            pass
 
 
 def _capture_and_crop(region, target_w=None, target_h=None):
