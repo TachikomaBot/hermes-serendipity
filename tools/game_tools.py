@@ -22,6 +22,70 @@ _game_handler.setFormatter(logging.Formatter("%(name)s [%(levelname)s] %(message
 logger.addHandler(_game_handler)
 logger.propagate = False  # Don't double-log through root's WARNING filter
 
+
+# ---------------------------------------------------------------------------
+# Discord webhook logging handler
+# ---------------------------------------------------------------------------
+
+class _DiscordWebhookHandler(logging.Handler):
+    """Send log messages to a Discord channel via webhook.
+
+    Non-blocking: fires HTTP POST in a daemon thread so it never blocks
+    the game loop. Batches rapid messages into a single post (0.5s window).
+    """
+
+    def __init__(self, webhook_url, level=logging.INFO):
+        super().__init__(level)
+        self._url = webhook_url
+        self._buffer = []
+        self._lock = __import__("threading").Lock()
+        self._timer = None
+        self.setFormatter(logging.Formatter("%(message)s"))
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            with self._lock:
+                self._buffer.append(msg)
+                if self._timer is None:
+                    import threading
+                    self._timer = threading.Timer(0.5, self._flush)
+                    self._timer.daemon = True
+                    self._timer.start()
+        except Exception:
+            self.handleError(record)
+
+    def _flush(self):
+        with self._lock:
+            lines = self._buffer[:]
+            self._buffer.clear()
+            self._timer = None
+        if not lines:
+            return
+        # Discord message limit is 2000 chars; truncate if needed
+        content = "```\n" + "\n".join(lines)
+        if len(content) > 1990:
+            content = content[:1987] + "..."
+        content += "\n```"
+        try:
+            import urllib.request
+            data = json.dumps({"content": content}).encode()
+            req = urllib.request.Request(
+                self._url, data=data,
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            pass  # Never let logging errors affect gameplay
+
+
+_DISCORD_LOG_WEBHOOK = os.environ.get("GAME_TOOLS_LOG_WEBHOOK", "")
+if _DISCORD_LOG_WEBHOOK:
+    _discord_handler = _DiscordWebhookHandler(_DISCORD_LOG_WEBHOOK, level=logging.INFO)
+    logger.addHandler(_discord_handler)
+    logger.info("Discord webhook logging enabled")
+
+
 DISPLAY = os.environ.get("DISPLAY", ":99")
 
 # ---------------------------------------------------------------------------
