@@ -59,7 +59,7 @@ _HERMES_CORE_TOOLS = [
     # Cross-platform messaging (gated on gateway running via check_fn)
     "send_message",
     # Game-playing (screenshot, click, key via vision + xdotool)
-    "game_screenshot", "game_click", "game_key",
+    "game_screenshot", "game_click", "game_key", "game_turn",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
 ]
