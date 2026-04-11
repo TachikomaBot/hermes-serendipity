@@ -72,11 +72,15 @@ class _DiscordWebhookHandler(logging.Handler):
             data = json.dumps({"content": content}).encode()
             req = urllib.request.Request(
                 self._url, data=data,
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "Serendipity/1.0",
+                },
             )
             urllib.request.urlopen(req, timeout=5)
-        except Exception:
-            pass  # Never let logging errors affect gameplay
+        except Exception as exc:
+            import sys
+            print(f"[DiscordWebhook] flush failed: {exc}", file=sys.stderr)
 
 
 _DISCORD_LOG_WEBHOOK = os.environ.get("GAME_TOOLS_LOG_WEBHOOK", "")
