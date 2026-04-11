@@ -214,6 +214,111 @@ def _should_escalate(game_state_text, turn_number, force_review,
     return False
 
 
+_LOCATE_SYSTEM_PROMPT = (
+    "You identify UI elements in screenshots and return bounding box "
+    "coordinates on a NORMALIZED 0-1000 scale. Respond with ONLY a JSON "
+    "object: {\"y0\": N, \"x0\": N, \"y1\": N, \"x1\": N, \"confidence\": "
+    "F, \"description\": \"...\"}\n"
+    "If target not visible: {\"y0\": null, \"x0\": null, \"y1\": null, "
+    "\"x1\": null, \"confidence\": 0, \"description\": \"...\"}"
+)
+
+# Bounding box area threshold: if Flash's first-pass bounding box is
+# smaller than this fraction of the screen, do a zoom pass for precision.
+_ZOOM_THRESHOLD = 0.04  # 4% of screen area → ~250x170px at 1920x1080
+
+
+def _precision_click(target, full_w, full_h, focus_fn):
+    """Locate a UI element and click it, using two-pass zoom for small targets.
+
+    Pass 1: Full screenshot → Flash locates target → bounding box.
+    If bounding box is small (< _ZOOM_THRESHOLD of screen), do Pass 2:
+      Crop region around target → zoom to 960x540 → Flash re-locates →
+      remap coordinates → click.
+    Otherwise: click directly from Pass 1 coordinates.
+
+    Returns result dict with status, target, pixel, confidence.
+    """
+    import time as _time
+
+    # ── PASS 1: full screenshot ──
+    img_b64, _, _ = _capture_and_downscale()
+    resp = _gemini_call(FLASH_MODEL, f"Locate: {target}", img_b64,
+                        system=_LOCATE_SYSTEM_PROMPT)
+    coords = _parse_json_response(resp)
+
+    if coords.get("x0") is None:
+        return {"status": "not_found", "target": target,
+                "description": coords.get("description", "")}
+    confidence = coords.get("confidence", 0)
+    if confidence < 0.5:
+        return {"status": "low_confidence", "target": target,
+                "confidence": confidence}
+
+    x0, y0 = coords["x0"], coords["y0"]
+    x1, y1 = coords["x1"], coords["y1"]
+    box_area = (x1 - x0) * (y1 - y0) / 1_000_000  # fraction of screen
+
+    # ── PASS 2: zoom if target is small ──
+    if box_area < _ZOOM_THRESHOLD:
+        # Expand bounding box by 50% padding for context, clamped to 0-1000
+        pad_w = max((x1 - x0) * 0.5, 50)
+        pad_h = max((y1 - y0) * 0.5, 50)
+        region = {
+            "x0": max(0, x0 - pad_w),
+            "y0": max(0, y0 - pad_h),
+            "x1": min(1000, x1 + pad_w),
+            "y1": min(1000, y1 + pad_h),
+        }
+        try:
+            zoomed_b64, _, _, crop_off = _capture_and_crop(region)
+            zoom_resp = _gemini_call(
+                FLASH_MODEL, f"Locate: {target}", zoomed_b64,
+                system=_LOCATE_SYSTEM_PROMPT,
+            )
+            zoom_coords = _parse_json_response(zoom_resp)
+
+            if (zoom_coords.get("x0") is not None
+                    and zoom_coords.get("confidence", 0) >= 0.5):
+                # Remap from crop-space (0-1000) to full-screen pixels
+                crop_w = crop_off["px_x1"] - crop_off["px_x0"]
+                crop_h = crop_off["px_y1"] - crop_off["px_y0"]
+                zx = int((zoom_coords["x0"] + zoom_coords["x1"]) / 2
+                         / 1000 * crop_w + crop_off["px_x0"])
+                zy = int((zoom_coords["y0"] + zoom_coords["y1"]) / 2
+                         / 1000 * crop_h + crop_off["px_y0"])
+
+                focus_fn()
+                env = {**os.environ, "DISPLAY": DISPLAY}
+                subprocess.run(
+                    ["xdotool", "mousemove", "--screen", "0",
+                     str(zx), str(zy), "click", "1"],
+                    env=env, check=True,
+                )
+                _time.sleep(0.3)
+                return {"status": "clicked", "target": target,
+                        "pixel": [zx, zy],
+                        "confidence": zoom_coords.get("confidence", 0),
+                        "zoom_pass": True}
+        except Exception:
+            logger.warning("precision_click: zoom pass failed, falling back",
+                           exc_info=True)
+
+    # ── Direct click from Pass 1 ──
+    cx = int((x0 + x1) / 2 / 1000 * full_w)
+    cy = int((y0 + y1) / 2 / 1000 * full_h)
+
+    focus_fn()
+    env = {**os.environ, "DISPLAY": DISPLAY}
+    subprocess.run(
+        ["xdotool", "mousemove", "--screen", "0", str(cx), str(cy), "click", "1"],
+        env=env, check=True,
+    )
+    _time.sleep(0.3)
+    return {"status": "clicked", "target": target, "pixel": [cx, cy],
+            "confidence": confidence}
+
+
 def _execute_action(action, full_w, full_h):
     """Execute a single game action (click, key, or end_turn). Returns result dict."""
     import time as _time
@@ -241,40 +346,7 @@ def _execute_action(action, full_w, full_h):
         if not target:
             return {"status": "error", "error": "no click target"}
         try:
-            # Capture fresh screenshot for coordinate lookup
-            img_b64, _, _ = _capture_and_downscale()
-            system = (
-                "You identify UI elements in screenshots and return bounding box "
-                "coordinates on a NORMALIZED 0-1000 scale. Respond with ONLY a JSON "
-                "object: {\"y0\": N, \"x0\": N, \"y1\": N, \"x1\": N, \"confidence\": "
-                "F, \"description\": \"...\"}\n"
-                "If target not visible: {\"y0\": null, \"x0\": null, \"y1\": null, "
-                "\"x1\": null, \"confidence\": 0, \"description\": \"...\"}"
-            )
-            resp = _gemini_call(FLASH_MODEL, f"Locate: {target}", img_b64, system=system)
-            coords = _parse_json_response(resp)
-
-            if coords.get("x0") is None:
-                return {"status": "not_found", "target": target,
-                        "description": coords.get("description", "")}
-            confidence = coords.get("confidence", 0)
-            if confidence < 0.5:
-                return {"status": "low_confidence", "target": target,
-                        "confidence": confidence}
-
-            cx = int((coords["x0"] + coords["x1"]) / 2 / 1000 * full_w)
-            cy = int((coords["y0"] + coords["y1"]) / 2 / 1000 * full_h)
-
-            _focus_game_window()
-            env = {**os.environ, "DISPLAY": DISPLAY}
-            subprocess.run(
-                ["xdotool", "mousemove", "--screen", "0", str(cx), str(cy), "click", "1"],
-                env=env, check=True,
-            )
-            import time as _time
-            _time.sleep(0.3)
-            return {"status": "clicked", "target": target, "pixel": [cx, cy],
-                    "confidence": confidence}
+            return _precision_click(target, full_w, full_h, _focus_game_window)
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
@@ -301,38 +373,10 @@ def _execute_ui_action(action, full_w, full_h, window_name=None):
         if not target:
             return {"status": "error", "error": "no click target"}
         try:
-            img_b64, _, _ = _capture_and_downscale()
-            system = (
-                "You identify UI elements in screenshots and return bounding box "
-                "coordinates on a NORMALIZED 0-1000 scale. Respond with ONLY a JSON "
-                "object: {\"y0\": N, \"x0\": N, \"y1\": N, \"x1\": N, \"confidence\": "
-                "F, \"description\": \"...\"}\n"
-                "If target not visible: {\"y0\": null, \"x0\": null, \"y1\": null, "
-                "\"x1\": null, \"confidence\": 0, \"description\": \"...\"}"
+            return _precision_click(
+                target, full_w, full_h,
+                lambda: _focus_window(window_name),
             )
-            resp = _gemini_call(FLASH_MODEL, f"Locate: {target}", img_b64, system=system)
-            coords = _parse_json_response(resp)
-
-            if coords.get("x0") is None:
-                return {"status": "not_found", "target": target,
-                        "description": coords.get("description", "")}
-            confidence = coords.get("confidence", 0)
-            if confidence < 0.5:
-                return {"status": "low_confidence", "target": target,
-                        "confidence": confidence}
-
-            cx = int((coords["x0"] + coords["x1"]) / 2 / 1000 * full_w)
-            cy = int((coords["y0"] + coords["y1"]) / 2 / 1000 * full_h)
-
-            _focus_window(window_name)
-            env = {**os.environ, "DISPLAY": DISPLAY}
-            subprocess.run(
-                ["xdotool", "mousemove", "--screen", "0", str(cx), str(cy), "click", "1"],
-                env=env, check=True,
-            )
-            _time.sleep(0.3)
-            return {"status": "clicked", "target": target, "pixel": [cx, cy],
-                    "confidence": confidence}
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
