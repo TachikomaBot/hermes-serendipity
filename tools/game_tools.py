@@ -32,7 +32,10 @@ class _DiscordWebhookHandler(logging.Handler):
 
     Non-blocking: fires HTTP POST in a daemon thread so it never blocks
     the game loop. Batches rapid messages into a single post (0.5s window).
+    Splits long payloads into multiple Discord messages (2000 char limit).
     """
+
+    _DISCORD_LIMIT = 1990  # leave room for code-block fences
 
     def __init__(self, webhook_url, level=logging.INFO):
         super().__init__(level)
@@ -55,6 +58,19 @@ class _DiscordWebhookHandler(logging.Handler):
         except Exception:
             self.handleError(record)
 
+    def _post(self, content):
+        """Send one Discord message. content should already include fences."""
+        import urllib.request
+        data = json.dumps({"content": content}).encode()
+        req = urllib.request.Request(
+            self._url, data=data,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "Serendipity/1.0",
+            },
+        )
+        urllib.request.urlopen(req, timeout=5)
+
     def _flush(self):
         with self._lock:
             lines = self._buffer[:]
@@ -62,22 +78,38 @@ class _DiscordWebhookHandler(logging.Handler):
             self._timer = None
         if not lines:
             return
-        # Discord message limit is 2000 chars; truncate if needed
-        content = "```\n" + "\n".join(lines)
-        if len(content) > 1990:
-            content = content[:1987] + "..."
-        content += "\n```"
         try:
-            import urllib.request
-            data = json.dumps({"content": content}).encode()
-            req = urllib.request.Request(
-                self._url, data=data,
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": "Serendipity/1.0",
-                },
-            )
-            urllib.request.urlopen(req, timeout=5)
+            # Build chunks that fit within Discord's limit
+            chunks = []
+            current = ""
+            for line in lines:
+                # If a single line exceeds the limit, split it
+                if len(line) > self._DISCORD_LIMIT - 10:
+                    # Flush current chunk first
+                    if current:
+                        chunks.append(current)
+                        current = ""
+                    # Split long line into parts
+                    remaining = line
+                    while remaining:
+                        part = remaining[:self._DISCORD_LIMIT - 10]
+                        remaining = remaining[len(part):]
+                        chunks.append(part + ("…" if remaining else ""))
+                    continue
+                # Would adding this line overflow?
+                if current and len(current) + len(line) + 1 > self._DISCORD_LIMIT - 10:
+                    chunks.append(current)
+                    current = ""
+                current = (current + "\n" + line) if current else line
+            if current:
+                chunks.append(current)
+
+            for chunk in chunks:
+                self._post(f"```\n{chunk}\n```")
+                # Small delay to respect Discord rate limits
+                if len(chunks) > 1:
+                    import time
+                    time.sleep(0.3)
         except Exception as exc:
             import sys
             print(f"[DiscordWebhook] flush failed: {exc}", file=sys.stderr)
@@ -783,7 +815,23 @@ def game_turn(args: dict, **kwargs) -> str:
             )
             final_state_text = _gemini_call(FLASH_MODEL, state_prompt, img_b64,
                                            response_schema=_STATE_ANALYSIS_SCHEMA)
-            logger.info("game_turn obs %d: %s", observations, final_state_text[:200])
+            # Log a compact human-readable observation summary
+            try:
+                _obs = _parse_json_response(final_state_text)
+                _unit = _obs.get("selected_unit")
+                _unit_str = f"{_unit['type']}@{_unit['at']}" if _unit else "none"
+                _mm = _obs.get("mismatches", [])
+                _obs_summary = (
+                    f"obs {observations}: {_obs.get('turn_info', '?')} | "
+                    f"screen={_obs.get('screen_type')} | unit={_unit_str} | "
+                    f"need_orders={_obs.get('units_needing_orders', [])} | "
+                    f"cities={[c.get('name') for c in _obs.get('cities', [])]}"
+                )
+                if _mm:
+                    _obs_summary += f" | ⚠MISMATCH: {_mm}"
+                logger.info("game_turn %s", _obs_summary)
+            except Exception:
+                logger.info("game_turn obs %d: %s", observations, final_state_text[:300])
 
             # ── ESCALATE? ──
             if _should_escalate(final_state_text, turn_number, force_review,
@@ -795,7 +843,7 @@ def game_turn(args: dict, **kwargs) -> str:
                 )
                 strategic_guidance = _gemini_call(PRO_MODEL, review_prompt, img_b64)
                 escalated = True
-                logger.info("game_turn Pro review: %s", strategic_guidance[:200])
+                logger.info("game_turn Pro review: %s", strategic_guidance[:800])
 
             # ── DECIDE ── (Flash picks actions)
             guidance_line = (f"STRATEGIC GUIDANCE: {strategic_guidance}"
@@ -825,6 +873,13 @@ def game_turn(args: dict, **kwargs) -> str:
 
             actions = plan.get("actions", [])
             turn_complete = plan.get("turn_complete", False)
+            _intent = plan.get("intent", "")
+            _action_strs = [
+                f"{a.get('action')}({a.get('target') or a.get('key', '')})"
+                for a in actions
+            ]
+            logger.info("game_turn plan: %s | intent: %s | done=%s",
+                        ", ".join(_action_strs), _intent[:120], turn_complete)
 
             if not actions or turn_complete:
                 break
@@ -840,6 +895,12 @@ def game_turn(args: dict, **kwargs) -> str:
                 if total_actions >= max_actions:
                     break
                 _time.sleep(0.3)
+
+            _result_strs = [
+                f"{a.get('action')}→{a.get('result', {}).get('status', '?')}"
+                for a in action_log[-len(actions):]
+            ]
+            logger.info("game_turn exec: %s", ", ".join(_result_strs))
 
             if batch_failures == len(actions):
                 consecutive_failures += 1
