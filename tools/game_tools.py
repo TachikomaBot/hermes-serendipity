@@ -658,17 +658,26 @@ Return JSON:
   "intent": "brief description of what this action sequence is trying to accomplish"
 }}
 
-Rules:
+PRIORITY ORDER (you MUST follow this):
+1. STRATEGIC GUIDANCE is MANDATORY — if guidance says "change production" or \
+"open city screen", you must do that BEFORE handling units or ending turn. \
+Do NOT skip strategic directives to take shortcuts like n/x/end_turn.
+2. Handle dialogs/popups (Escape or click Close)
+3. Resolve mismatches reported in GAME STATE — e.g. wrong production, wrong \
+unit selected, hidden units. These take priority over routine unit orders.
+4. Then handle unit orders.
+5. Set turn_complete: true ONLY when all of the above are addressed.
+
+Other rules:
 - Max 5 actions per batch
-- Handle dialogs/popups FIRST (Escape or click Close)
 - VERIFY the correct unit is selected before issuing unit commands
-- If state reports mismatches, resolve them FIRST (e.g. scroll to find hidden \
-units, select the correct unit before acting)
 - Actions often require multi-step sequences. Think in terms of goals:
   e.g. "found city" = select Settler → verify Settler is active → press B
+  e.g. "change production" = double-click city → click Change Production → \
+select item → close city screen
   e.g. "move unit" = select unit → press G (or movement key) → click destination
 - If a list or panel might have hidden items (count mismatch), try scrolling
-- Set turn_complete: true when all units have orders and turn should end"""
+- Do NOT end turn if strategic guidance hasn't been addressed yet"""
 
 _STRATEGIC_REVIEW_PROMPT = """\
 You are a strategic advisor for a turn-based strategy game.
@@ -846,8 +855,11 @@ def game_turn(args: dict, **kwargs) -> str:
                 logger.info("game_turn Pro review: %s", strategic_guidance[:800])
 
             # ── DECIDE ── (Flash picks actions)
-            guidance_line = (f"STRATEGIC GUIDANCE: {strategic_guidance}"
-                            if strategic_guidance else "")
+            guidance_line = (
+                f"⚠ MANDATORY STRATEGIC DIRECTIVES (from senior advisor — "
+                f"execute these BEFORE routine actions):\n{strategic_guidance}"
+                if strategic_guidance else ""
+            )
             game_knowledge_line = (
                 f"GAME KNOWLEDGE:\n{game_knowledge}" if game_knowledge else ""
             )
