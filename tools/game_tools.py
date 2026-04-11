@@ -12,6 +12,12 @@ import tempfile
 import logging
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+# Ensure at least one handler so our logs actually appear
+if not logger.handlers and not logging.getLogger().handlers:
+    _handler = logging.StreamHandler()
+    _handler.setLevel(logging.DEBUG)
+    logger.addHandler(_handler)
 
 DISPLAY = os.environ.get("DISPLAY", ":99")
 
