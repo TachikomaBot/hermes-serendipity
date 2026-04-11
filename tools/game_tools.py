@@ -50,6 +50,93 @@ def _normalize_key(key):
     """Normalize key names to xdotool format."""
     return _KEY_NORMALIZE.get(key.lower().strip(), key)
 
+# ---------------------------------------------------------------------------
+# Structured output schemas for Gemini
+# ---------------------------------------------------------------------------
+
+_STATE_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "screen_type": {"type": "string", "enum": [
+            "main_map", "city_view", "dialog", "unit_selection", "menu", "other",
+        ]},
+        "turn_info": {"type": "string"},
+        "selected_unit": {
+            "type": "object",
+            "properties": {
+                "type": {"type": "string"},
+                "at": {"type": "string"},
+            },
+            "nullable": True,
+        },
+        "units_needing_orders": {
+            "type": "array", "items": {"type": "string"},
+        },
+        "unit_count_on_tile": {"type": "integer", "nullable": True},
+        "units_visible_in_panel": {"type": "integer"},
+        "cities": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "production": {"type": "string"},
+                    "turns_left": {"type": "integer"},
+                },
+            },
+        },
+        "threats": {"type": "array", "items": {"type": "string"}},
+        "resources": {
+            "type": "object",
+            "properties": {
+                "gold": {"type": "integer"},
+                "researching": {"type": "string"},
+            },
+        },
+        "notifications": {"type": "array", "items": {"type": "string"}},
+        "observations": {"type": "array", "items": {"type": "string"}},
+        "surprise_level": {"type": "string", "enum": ["none", "low", "high"]},
+        "mismatches": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["screen_type", "turn_info", "mismatches"],
+}
+
+_ACTION_DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "actions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": [
+                        "click", "key", "end_turn",
+                    ]},
+                    "target": {"type": "string"},
+                    "key": {"type": "string"},
+                },
+                "required": ["action"],
+            },
+        },
+        "turn_complete": {"type": "boolean"},
+        "intent": {"type": "string"},
+    },
+    "required": ["actions", "turn_complete"],
+}
+
+_LOCATE_ELEMENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "y0": {"type": "integer", "nullable": True},
+        "x0": {"type": "integer", "nullable": True},
+        "y1": {"type": "integer", "nullable": True},
+        "x1": {"type": "integer", "nullable": True},
+        "confidence": {"type": "number"},
+        "description": {"type": "string"},
+    },
+    "required": ["x0", "y0", "x1", "y1", "confidence", "description"],
+}
+
 ESCALATION_KEYWORDS = [
     "enemy", "barbarian", "attack", "war", "declare",
     "disaster", "famine", "revolt", "unknown civilization",
@@ -170,8 +257,12 @@ def _capture_and_crop(region, target_w=None, target_h=None):
                 pass
 
 
-def _gemini_call(model, prompt, image_b64, system=None):
-    """Call Gemini with an image + prompt. Returns response text. Retries once."""
+def _gemini_call(model, prompt, image_b64, system=None, response_schema=None):
+    """Call Gemini with an image + prompt. Returns response text. Retries once.
+
+    If response_schema is provided, enables structured output (JSON mode)
+    so the response is guaranteed valid JSON matching the schema.
+    """
     import time as _time
     from google import genai
     client = genai.Client()
@@ -181,6 +272,9 @@ def _gemini_call(model, prompt, image_b64, system=None):
     }
     if system:
         config["system_instruction"] = system
+    if response_schema is not None:
+        config["response_mime_type"] = "application/json"
+        config["response_schema"] = response_schema
     contents = [{
         "role": "user",
         "parts": [
@@ -268,7 +362,8 @@ def _precision_click(target, full_w, full_h, focus_fn):
     # ── PASS 1: full screenshot ──
     img_b64, _, _ = _capture_and_downscale()
     resp = _gemini_call(FLASH_MODEL, f"Locate: {target}", img_b64,
-                        system=_LOCATE_SYSTEM_PROMPT)
+                        system=_LOCATE_SYSTEM_PROMPT,
+                        response_schema=_LOCATE_ELEMENT_SCHEMA)
     coords = _parse_json_response(resp)
 
     if coords.get("x0") is None:
@@ -299,6 +394,7 @@ def _precision_click(target, full_w, full_h, focus_fn):
             zoom_resp = _gemini_call(
                 FLASH_MODEL, f"Locate: {target}", zoomed_b64,
                 system=_LOCATE_SYSTEM_PROMPT,
+                response_schema=_LOCATE_ELEMENT_SCHEMA,
             )
             zoom_coords = _parse_json_response(zoom_resp)
 
@@ -617,7 +713,8 @@ def game_turn(args: dict, **kwargs) -> str:
                       "key": a.get("key"), "result": a.get("result", {}).get("status")}
                      for a in action_log[-5:]]),
             )
-            final_state_text = _gemini_call(FLASH_MODEL, state_prompt, img_b64)
+            final_state_text = _gemini_call(FLASH_MODEL, state_prompt, img_b64,
+                                           response_schema=_STATE_ANALYSIS_SCHEMA)
             logger.info("game_turn obs %d: %s", observations, final_state_text[:200])
 
             # ── ESCALATE? ──
@@ -649,7 +746,8 @@ def game_turn(args: dict, **kwargs) -> str:
                 remaining=max_actions - total_actions,
                 game_knowledge_line=game_knowledge_line,
             )
-            decide_text = _gemini_call(FLASH_MODEL, decide_prompt, img_b64)
+            decide_text = _gemini_call(FLASH_MODEL, decide_prompt, img_b64,
+                                       response_schema=_ACTION_DECISION_SCHEMA)
             try:
                 plan = _parse_json_response(decide_text)
             except (json.JSONDecodeError, ValueError):
