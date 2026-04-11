@@ -45,12 +45,13 @@ def _check_game_requirements() -> bool:
         return False
 
 
-def _focus_game_window():
-    """Focus the active game window before sending input."""
+def _focus_window(window_name=None):
+    """Focus a window by name, or no-op if None (use whatever is active)."""
+    if window_name is None:
+        return True
     import time
     env = {**os.environ, "DISPLAY": DISPLAY}
-    # Try known game windows
-    for name in ["Freeciv", "Unciv"]:
+    for name in (window_name.split("|") if "|" in window_name else [window_name]):
         result = subprocess.run(
             ["xdotool", "search", "--name", name],
             capture_output=True, text=True, env=env,
@@ -64,6 +65,11 @@ def _focus_game_window():
             time.sleep(0.2)
             return True
     return False
+
+
+def _focus_game_window():
+    """Focus the active game window before sending input."""
+    return _focus_window("Freeciv|Unciv")
 
 
 def _capture_and_downscale(target_w=None, target_h=None):
@@ -91,6 +97,52 @@ def _capture_and_downscale(target_w=None, target_h=None):
         return img_b64, full_w, full_h
     finally:
         for p in (path_full, path_small):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def _capture_and_crop(region, target_w=None, target_h=None):
+    """Capture screenshot, crop to region (0-1000 normalized), resize for vision.
+
+    Returns (b64, full_w, full_h, crop_offset_dict).
+    crop_offset has px_x0, px_y0, px_x1, px_y1 for coordinate remapping.
+    """
+    tw, th = target_w or DEFAULT_DOWNSCALE[0], target_h or DEFAULT_DOWNSCALE[1]
+    path_full = tempfile.mktemp(suffix=".png")
+    path_crop = tempfile.mktemp(suffix="_crop.png")
+    try:
+        subprocess.run(
+            ["import", "-display", DISPLAY, "-window", "root", path_full],
+            check=True,
+        )
+        result = subprocess.run(
+            ["identify", "-format", "%w %h", path_full],
+            capture_output=True, text=True, check=True,
+        )
+        full_w, full_h = map(int, result.stdout.strip().split())
+
+        # Convert normalized 0-1000 to pixels
+        px0 = int(region["x0"] / 1000 * full_w)
+        py0 = int(region["y0"] / 1000 * full_h)
+        px1 = int(region["x1"] / 1000 * full_w)
+        py1 = int(region["y1"] / 1000 * full_h)
+        crop_w = max(px1 - px0, 1)
+        crop_h = max(py1 - py0, 1)
+
+        subprocess.run(
+            ["convert", path_full, "-crop", f"{crop_w}x{crop_h}+{px0}+{py0}",
+             "+repage", "-resize", f"{tw}x{th}", path_crop],
+            check=True,
+        )
+        with open(path_crop, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode()
+        return img_b64, full_w, full_h, {
+            "px_x0": px0, "px_y0": py0, "px_x1": px1, "px_y1": py1,
+        }
+    finally:
+        for p in (path_full, path_crop):
             try:
                 os.unlink(p)
             except OSError:
@@ -214,6 +266,64 @@ def _execute_action(action, full_w, full_h):
                 env=env, check=True,
             )
             import time as _time
+            _time.sleep(0.3)
+            return {"status": "clicked", "target": target, "pixel": [cx, cy],
+                    "confidence": confidence}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    return {"status": "error", "error": f"unknown action type: {act_type}"}
+
+
+def _execute_ui_action(action, full_w, full_h, window_name=None):
+    """Execute a UI action (click or key) in any window. Returns result dict."""
+    import time as _time
+    act_type = action.get("action", "")
+
+    if act_type == "key":
+        key = action.get("key", "")
+        if not key:
+            return {"status": "error", "error": "no key specified"}
+        _focus_window(window_name)
+        env = {**os.environ, "DISPLAY": DISPLAY}
+        subprocess.run(["xdotool", "key", key], env=env, check=True)
+        _time.sleep(0.3)
+        return {"status": "pressed", "key": key}
+
+    if act_type == "click":
+        target = action.get("target", "")
+        if not target:
+            return {"status": "error", "error": "no click target"}
+        try:
+            img_b64, _, _ = _capture_and_downscale()
+            system = (
+                "You identify UI elements in screenshots and return bounding box "
+                "coordinates on a NORMALIZED 0-1000 scale. Respond with ONLY a JSON "
+                "object: {\"y0\": N, \"x0\": N, \"y1\": N, \"x1\": N, \"confidence\": "
+                "F, \"description\": \"...\"}\n"
+                "If target not visible: {\"y0\": null, \"x0\": null, \"y1\": null, "
+                "\"x1\": null, \"confidence\": 0, \"description\": \"...\"}"
+            )
+            resp = _gemini_call(FLASH_MODEL, f"Locate: {target}", img_b64, system=system)
+            coords = _parse_json_response(resp)
+
+            if coords.get("x0") is None:
+                return {"status": "not_found", "target": target,
+                        "description": coords.get("description", "")}
+            confidence = coords.get("confidence", 0)
+            if confidence < 0.5:
+                return {"status": "low_confidence", "target": target,
+                        "confidence": confidence}
+
+            cx = int((coords["x0"] + coords["x1"]) / 2 / 1000 * full_w)
+            cy = int((coords["y0"] + coords["y1"]) / 2 / 1000 * full_h)
+
+            _focus_window(window_name)
+            env = {**os.environ, "DISPLAY": DISPLAY}
+            subprocess.run(
+                ["xdotool", "mousemove", "--screen", "0", str(cx), str(cy), "click", "1"],
+                env=env, check=True,
+            )
             _time.sleep(0.3)
             return {"status": "clicked", "target": target, "pixel": [cx, cy],
                     "confidence": confidence}
@@ -476,6 +586,599 @@ def game_turn(args: dict, **kwargs) -> str:
             "partial_summary": partial,
             "actions_taken": total_actions,
         })
+
+
+# ---------------------------------------------------------------------------
+# menu_navigate prompts
+# ---------------------------------------------------------------------------
+
+_MENU_ANALYSIS_PROMPT = """\
+Analyze this UI screenshot. Return ONLY a JSON object:
+{{
+  "screen_description": "brief description of current screen/dialog",
+  "screen_id": "short_stable_id e.g. main_menu, game_config, nation_picker",
+  "ui_elements": [
+    {{"label": "...", "type": "button|dropdown|tab|field|checkbox|menu_item",
+      "state": "enabled|disabled|selected|checked"}}
+  ],
+  "goal_reached": false,
+  "decision_needed": null,
+  "region_of_interest": null,
+  "stuck": false
+}}
+
+If there's a choice to make (dropdown, radio buttons, picker, config option)
+where preferences don't specify what to pick, set decision_needed to:
+{{"description": "what choice", "options": ["opt1", "opt2"], "default": "pre-selected"}}
+
+region_of_interest: {{"x0": N, "y0": N, "x1": N, "y1": N}} normalized 0-1000
+for the area most relevant to the current goal. Useful if we get stuck.
+
+{mode_context}
+
+Previous actions: {recent_actions}
+Step {step} of {max_steps}"""
+
+_MENU_ACTION_PROMPT = """\
+You are navigating a UI to reach this goal: {goal}
+User preferences: {preferences}
+{guidance_line}
+
+Current screen: {screen_analysis}
+Previous actions: {recent_actions}
+
+Pick exactly 1 action (or 2 if the second is an obvious follow-up like pressing \
+Enter after typing).
+
+Return JSON:
+{{
+  "actions": [
+    {{"action": "click", "target": "description of element to click"}}
+  ],
+  "reasoning": "brief explanation"
+}}
+
+Rules:
+- Prefer CLICKING buttons/menu items over keyboard shortcuts
+- After clicking a menu item, STOP and wait for verification
+- If a dialog is blocking, dismiss it first (click OK/Close or press Escape)
+- If you need to type, use {{"action": "key", "key": "xdotool key sequence"}}"""
+
+_MENU_EXPLORE_ACTION_PROMPT = """\
+You are exploring an unfamiliar application interface to learn what it can do.
+
+CURRENT SCREEN: {screen_analysis}
+ALREADY EXPLORED: {explored_screens}
+UNEXPLORED ELEMENTS: {unexplored}
+DEPTH: {depth}/{max_depth}
+PRO GUIDANCE: {guidance}
+
+Pick 1 action to learn more about this interface. Prefer:
+1. Unexplored menu items, buttons, or tabs that lead to new screens
+2. Dropdowns (click to see options, then Escape to close)
+3. Skip elements that are decorative or unlikely to reveal new information
+
+Return JSON:
+{{
+  "action": "click|key",
+  "target": "description of element",
+  "expect": "dialog|dropdown|new_screen|toggle",
+  "back_action": "Escape|click Close|click Back",
+  "done_exploring_screen": false
+}}
+
+Set done_exploring_screen to true if all interesting elements on this screen \
+have been explored or cataloged."""
+
+_MENU_DECISION_PROMPT = """\
+You are helping navigate a UI. A choice needs to be made.
+
+GOAL: {goal}
+USER PREFERENCES: {preferences}
+CURRENT SCREEN: {screen_description}
+
+DECISION NEEDED: {decision_description}
+AVAILABLE OPTIONS: {options}
+DEFAULT/PRE-SELECTED: {default}
+
+Pick the best option considering:
+1. User preferences (if they specified anything relevant)
+2. Reasonable defaults for the goal
+3. Common/recommended settings
+
+Return JSON:
+{{"choice": "the option to select", "reasoning": "brief explanation"}}"""
+
+_MENU_EXPLORE_PRIORITY_PROMPT = """\
+You are helping explore an unfamiliar application interface.
+
+APPLICATION CONTEXT: {context}
+SCREENS MAPPED SO FAR: {interface_map_summary}
+CURRENT SCREEN ELEMENTS: {ui_elements}
+EXPLORATION BUDGET: {steps_remaining} steps left
+
+Which elements are most worth exploring? Consider:
+- What would a user need to know to operate this application?
+- Which elements likely lead to new screens vs. simple toggles?
+- What's the most efficient exploration order?
+
+Return JSON:
+{{
+  "priority_elements": ["element1", "element2"],
+  "skip_elements": ["element3"],
+  "observations": "any high-level observations about the application",
+  "enough": false
+}}
+
+Set "enough" to true if the interface map is already comprehensive enough \
+to write a useful guide."""
+
+_MENU_STUCK_PROMPT = """\
+Flash vision model is stuck navigating a UI. Same screen {repeat_count} times.
+
+GOAL: {goal}
+CURRENT SCREEN: {screen_description}
+RECENT ACTIONS (all failed to make progress): {recent_actions}
+
+Examine the screenshot carefully. What should we try?
+Return JSON:
+{{
+  "diagnosis": "what's likely going wrong",
+  "actions": [
+    {{"action": "click", "target": "very specific element description"}}
+  ],
+  "give_up": false,
+  "give_up_reason": null
+}}
+
+Set give_up to true only if the goal is genuinely unreachable from this screen."""
+
+
+# ---------------------------------------------------------------------------
+# menu_navigate constants
+# ---------------------------------------------------------------------------
+
+MENU_NAV_TIMEOUT_EXPLOIT = 90
+MENU_NAV_TIMEOUT_EXPLORE = 120
+MENU_NAV_MAX_STEPS_CAP = 40
+
+
+# ---------------------------------------------------------------------------
+# menu_navigate handler
+# ---------------------------------------------------------------------------
+
+def _menu_exploit_loop(goal, preferences, max_steps, window_name):
+    """Goal-directed UI navigation loop. Returns result dict."""
+    import time as _time
+
+    action_log = []
+    step = 0
+    prev_screen_id = None
+    same_screen_count = 0
+    pro_decisions = []
+    start_time = _time.monotonic()
+
+    while step < max_steps and (_time.monotonic() - start_time) < MENU_NAV_TIMEOUT_EXPLOIT:
+        step += 1
+
+        # ── CAPTURE & ANALYZE ──
+        img_b64, full_w, full_h = _capture_and_downscale()
+
+        mode_context = f"GOAL: {goal}\nPREFERENCES: {preferences or '(none)'}"
+        analysis_prompt = _MENU_ANALYSIS_PROMPT.format(
+            mode_context=mode_context,
+            recent_actions=json.dumps([
+                {"action": a.get("action"), "target": a.get("target"),
+                 "key": a.get("key"), "status": a.get("result", {}).get("status")}
+                for a in action_log[-5:]
+            ]),
+            step=step, max_steps=max_steps,
+        )
+        analysis_text = _gemini_call(FLASH_MODEL, analysis_prompt, img_b64)
+
+        try:
+            analysis = _parse_json_response(analysis_text)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("menu_navigate: bad analysis JSON: %s", analysis_text[:200])
+            analysis = {"screen_description": analysis_text[:200],
+                        "screen_id": "unknown", "goal_reached": False}
+
+        logger.info("menu_navigate step %d: screen=%s", step,
+                     analysis.get("screen_id", "?"))
+
+        # ── GOAL REACHED? ──
+        if analysis.get("goal_reached"):
+            return {
+                "status": "goal_reached",
+                "summary": f"Reached goal in {step} steps: "
+                           f"{analysis.get('screen_description', '')}",
+                "steps_taken": step,
+                "actions": len(action_log),
+                "pro_decisions": len(pro_decisions),
+            }
+
+        # ── STUCK DETECTION ──
+        screen_id = analysis.get("screen_id", "")
+        if screen_id == prev_screen_id:
+            same_screen_count += 1
+        else:
+            same_screen_count = 0
+            prev_screen_id = screen_id
+
+        if same_screen_count >= 3:
+            # Phase 1: Crop and zoom
+            roi = analysis.get("region_of_interest")
+            if roi and same_screen_count == 3:
+                try:
+                    cropped_b64, _, _, crop_off = _capture_and_crop(roi)
+                    zoom_prompt = _MENU_ACTION_PROMPT.format(
+                        goal=goal, preferences=preferences or "(none)",
+                        guidance_line="NOTE: This is a ZOOMED view of the area of interest.",
+                        screen_analysis=analysis_text[:1000],
+                        recent_actions="(stuck — retrying with zoom)",
+                    )
+                    zoom_text = _gemini_call(FLASH_MODEL, zoom_prompt, cropped_b64)
+                    zoom_plan = _parse_json_response(zoom_text)
+                    for action in zoom_plan.get("actions", [])[:1]:
+                        result = _execute_ui_action(action, full_w, full_h, window_name)
+                        action_log.append({**action, "result": result, "zoomed": True})
+                    _time.sleep(0.4)
+                    continue
+                except Exception:
+                    logger.warning("menu_navigate: zoom retry failed", exc_info=True)
+
+            # Phase 2: Escalate to Pro
+            if same_screen_count >= 4:
+                try:
+                    stuck_prompt = _MENU_STUCK_PROMPT.format(
+                        goal=goal,
+                        screen_description=analysis.get("screen_description", ""),
+                        recent_actions=json.dumps([
+                            {"action": a.get("action"), "target": a.get("target"),
+                             "status": a.get("result", {}).get("status")}
+                            for a in action_log[-5:]
+                        ]),
+                        repeat_count=same_screen_count,
+                    )
+                    pro_text = _gemini_call(PRO_MODEL, stuck_prompt, img_b64)
+                    pro_plan = _parse_json_response(pro_text)
+                    if pro_plan.get("give_up"):
+                        return {
+                            "status": "stuck",
+                            "summary": f"Unable to reach goal after {step} steps. "
+                                       f"Diagnosis: {pro_plan.get('give_up_reason', 'unknown')}",
+                            "steps_taken": step,
+                            "actions": len(action_log),
+                        }
+                    for action in pro_plan.get("actions", [])[:2]:
+                        result = _execute_ui_action(action, full_w, full_h, window_name)
+                        action_log.append({**action, "result": result, "pro_directed": True})
+                    same_screen_count = 0
+                    _time.sleep(0.4)
+                    continue
+                except Exception:
+                    logger.warning("menu_navigate: Pro stuck resolution failed",
+                                   exc_info=True)
+
+            # Phase 3: Unrecoverable
+            if same_screen_count >= 6:
+                return {
+                    "status": "stuck",
+                    "summary": f"Stuck after {step} steps on: "
+                               f"{analysis.get('screen_description', '')}",
+                    "steps_taken": step,
+                    "actions": len(action_log),
+                }
+
+        # ── DECISION POINT? ──
+        guidance_line = ""
+        decision = analysis.get("decision_needed")
+        if decision and isinstance(decision, dict):
+            try:
+                decision_prompt = _MENU_DECISION_PROMPT.format(
+                    goal=goal,
+                    preferences=preferences or "(none specified)",
+                    screen_description=analysis.get("screen_description", ""),
+                    decision_description=decision.get("description", ""),
+                    options=json.dumps(decision.get("options", [])),
+                    default=decision.get("default", "unknown"),
+                )
+                pro_text = _gemini_call(PRO_MODEL, decision_prompt, img_b64)
+                pro_decision = _parse_json_response(pro_text)
+                pro_decisions.append(pro_decision)
+                guidance_line = (
+                    f"PRO DECISION: Select '{pro_decision.get('choice', '')}' "
+                    f"— {pro_decision.get('reasoning', '')}"
+                )
+            except Exception:
+                logger.warning("menu_navigate: Pro decision failed", exc_info=True)
+
+        # ── DECIDE ACTION (Flash) ──
+        action_prompt = _MENU_ACTION_PROMPT.format(
+            goal=goal,
+            preferences=preferences or "(none)",
+            guidance_line=guidance_line,
+            screen_analysis=analysis_text[:1000],
+            recent_actions=json.dumps([
+                {"action": a.get("action"), "target": a.get("target"),
+                 "status": a.get("result", {}).get("status")}
+                for a in action_log[-3:]
+            ]),
+        )
+        action_text = _gemini_call(FLASH_MODEL, action_prompt, img_b64)
+
+        try:
+            plan = _parse_json_response(action_text)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("menu_navigate: bad action JSON: %s", action_text[:200])
+            continue
+
+        actions = plan.get("actions", [])[:2]
+        if not actions:
+            continue
+
+        # ── EXECUTE ──
+        for action in actions:
+            result = _execute_ui_action(action, full_w, full_h, window_name)
+            action_log.append({**action, "result": result})
+            _time.sleep(0.4)
+
+    return {
+        "status": "max_steps_reached",
+        "summary": f"Exhausted {step} steps without reaching goal: {goal}",
+        "steps_taken": step,
+        "actions": len(action_log),
+        "pro_decisions": len(pro_decisions),
+    }
+
+
+def _menu_explore_loop(context, max_steps, max_depth, window_name):
+    """Exploration loop — map an unfamiliar interface. Returns result dict."""
+    import time as _time
+
+    interface_map = {}        # screen_id → {description, elements, parent}
+    visited_screens = set()
+    explore_stack = []        # [(screen_id, back_action)]
+    action_log = []
+    step = 0
+    current_depth = 0
+    pro_guidance = ""
+    pro_observations = ""
+    start_time = _time.monotonic()
+
+    while step < max_steps and (_time.monotonic() - start_time) < MENU_NAV_TIMEOUT_EXPLORE:
+        step += 1
+
+        # ── CAPTURE & ANALYZE ──
+        img_b64, full_w, full_h = _capture_and_downscale()
+
+        mode_context = (
+            "MODE: exploration. Catalog ALL visible UI elements thoroughly. "
+            "Include element types, states, and any visible options/values.\n"
+            f"APPLICATION CONTEXT: {context}"
+        )
+        analysis_prompt = _MENU_ANALYSIS_PROMPT.format(
+            mode_context=mode_context,
+            recent_actions=json.dumps([
+                {"action": a.get("action"), "target": a.get("target"),
+                 "status": a.get("result", {}).get("status")}
+                for a in action_log[-5:]
+            ]),
+            step=step, max_steps=max_steps,
+        )
+        analysis_text = _gemini_call(FLASH_MODEL, analysis_prompt, img_b64)
+
+        try:
+            analysis = _parse_json_response(analysis_text)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("menu_explore: bad analysis JSON: %s", analysis_text[:200])
+            analysis = {"screen_description": analysis_text[:200],
+                        "screen_id": f"unknown_{step}", "ui_elements": []}
+
+        screen_id = analysis.get("screen_id", f"screen_{step}")
+        logger.info("menu_explore step %d: screen=%s depth=%d",
+                     step, screen_id, current_depth)
+
+        # ── RECORD SCREEN ──
+        if screen_id not in interface_map:
+            parent = explore_stack[-1][0] if explore_stack else None
+            interface_map[screen_id] = {
+                "description": analysis.get("screen_description", ""),
+                "elements": analysis.get("ui_elements", []),
+                "parent": parent,
+            }
+
+        # ── PRO PRIORITIZATION (every 3 new screens) ──
+        if len(interface_map) % 3 == 0 and screen_id not in visited_screens:
+            try:
+                map_summary = {sid: {"desc": info["description"],
+                                     "n_elements": len(info["elements"])}
+                               for sid, info in interface_map.items()}
+                priority_prompt = _MENU_EXPLORE_PRIORITY_PROMPT.format(
+                    context=context,
+                    interface_map_summary=json.dumps(map_summary),
+                    ui_elements=json.dumps(analysis.get("ui_elements", [])),
+                    steps_remaining=max_steps - step,
+                )
+                pro_text = _gemini_call(PRO_MODEL, priority_prompt, img_b64)
+                pro_priority = _parse_json_response(pro_text)
+                pro_guidance = json.dumps(pro_priority.get("priority_elements", []))
+                if pro_priority.get("observations"):
+                    pro_observations = pro_priority["observations"]
+                if pro_priority.get("enough"):
+                    logger.info("menu_explore: Pro says enough")
+                    break
+            except Exception:
+                logger.warning("menu_explore: Pro priority failed", exc_info=True)
+
+        # ── CHECK IF SCREEN FULLY EXPLORED ──
+        if screen_id in visited_screens:
+            # Back out
+            if explore_stack:
+                _, back_action = explore_stack.pop()
+                current_depth = max(0, current_depth - 1)
+                if back_action:
+                    back = {"action": "key", "key": back_action} if back_action in (
+                        "Escape", "Return", "BackSpace"
+                    ) else {"action": "click", "target": back_action}
+                    result = _execute_ui_action(back, full_w, full_h, window_name)
+                    action_log.append({**back, "result": result, "back_nav": True})
+                    _time.sleep(0.4)
+                continue
+            else:
+                break  # Nothing left to explore
+
+        # ── DEPTH CHECK ──
+        if current_depth >= max_depth:
+            visited_screens.add(screen_id)
+            if explore_stack:
+                _, back_action = explore_stack.pop()
+                current_depth = max(0, current_depth - 1)
+                if back_action:
+                    back = {"action": "key", "key": back_action} if back_action in (
+                        "Escape", "Return", "BackSpace"
+                    ) else {"action": "click", "target": back_action}
+                    result = _execute_ui_action(back, full_w, full_h, window_name)
+                    action_log.append({**back, "result": result, "back_nav": True})
+                    _time.sleep(0.4)
+                continue
+            else:
+                break
+
+        # ── PICK NEXT ELEMENT TO EXPLORE (Flash) ──
+        explored_labels = [e.get("label", "") for e in
+                           interface_map.get(screen_id, {}).get("elements", [])
+                           if e.get("_explored")]
+        all_labels = [e.get("label", "") for e in analysis.get("ui_elements", [])]
+        unexplored = [l for l in all_labels if l and l not in explored_labels]
+
+        if not unexplored:
+            visited_screens.add(screen_id)
+            continue
+
+        explore_prompt = _MENU_EXPLORE_ACTION_PROMPT.format(
+            screen_analysis=analysis_text[:1000],
+            explored_screens=json.dumps(list(visited_screens)),
+            unexplored=json.dumps(unexplored),
+            depth=current_depth, max_depth=max_depth,
+            guidance=pro_guidance or "(none)",
+        )
+        explore_text = _gemini_call(FLASH_MODEL, explore_prompt, img_b64)
+
+        try:
+            explore_plan = _parse_json_response(explore_text)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("menu_explore: bad explore JSON: %s", explore_text[:200])
+            visited_screens.add(screen_id)
+            continue
+
+        if explore_plan.get("done_exploring_screen"):
+            visited_screens.add(screen_id)
+            continue
+
+        # ── EXECUTE EXPLORATION ACTION ──
+        action = {
+            "action": explore_plan.get("action", "click"),
+            "target": explore_plan.get("target", ""),
+            "key": explore_plan.get("key", explore_plan.get("target", "")),
+        }
+        back_action = explore_plan.get("back_action", "Escape")
+        expected = explore_plan.get("expect", "new_screen")
+
+        result = _execute_ui_action(action, full_w, full_h, window_name)
+        action_log.append({**action, "result": result})
+        _time.sleep(0.5)
+
+        # Mark element as explored in the map
+        target_label = explore_plan.get("target", "")
+        for elem in interface_map.get(screen_id, {}).get("elements", []):
+            if elem.get("label", "") == target_label:
+                elem["_explored"] = True
+                break
+
+        # If we expect a new screen, push onto stack
+        if expected in ("new_screen", "dialog"):
+            explore_stack.append((screen_id, back_action))
+            current_depth += 1
+        elif expected == "dropdown":
+            # Catalog dropdown options on next iteration, then close
+            explore_stack.append((screen_id, back_action))
+            # Don't increment depth — dropdown is same logical screen
+
+    # ── BUILD NAVIGATION HINTS ──
+    nav_hints = []
+    for sid, info in interface_map.items():
+        parent = info.get("parent")
+        if parent:
+            # Find which element led here
+            for elem in interface_map.get(parent, {}).get("elements", []):
+                if elem.get("_explored"):
+                    nav_hints.append(f"{parent} → {elem.get('label', '?')} → {sid}")
+                    break
+
+    # Clean internal markers from output
+    clean_map = {}
+    for sid, info in interface_map.items():
+        clean_elements = []
+        for elem in info.get("elements", []):
+            clean_elem = {k: v for k, v in elem.items() if not k.startswith("_")}
+            clean_elements.append(clean_elem)
+        clean_map[sid] = {
+            "description": info.get("description", ""),
+            "elements": clean_elements,
+            "parent": info.get("parent"),
+        }
+
+    return {
+        "status": "explored",
+        "application": context,
+        "screens_visited": len(visited_screens),
+        "interface_map": clean_map,
+        "navigation_hints": nav_hints,
+        "pro_observations": pro_observations,
+        "steps_taken": step,
+        "actions": len(action_log),
+    }
+
+
+def menu_navigate(args: dict, **kwargs) -> str:
+    """Navigate application menus or explore an unfamiliar interface.
+
+    Two modes:
+    - exploit (default): Goal-directed navigation to a target screen/state.
+    - explore: Systematically map an unfamiliar interface for learning.
+    """
+    mode = args.get("mode", "exploit")
+
+    if mode == "explore":
+        context = args.get("context", "")
+        if not context:
+            return json.dumps({"status": "error",
+                               "error": "context is required for explore mode"})
+        max_steps = min(args.get("max_steps", 25), MENU_NAV_MAX_STEPS_CAP)
+        max_depth = args.get("max_depth", 3)
+        window_name = args.get("window_name")
+        try:
+            result = _menu_explore_loop(context, max_steps, max_depth, window_name)
+            return json.dumps(result)
+        except Exception as e:
+            logger.exception("menu_navigate explore error")
+            return json.dumps({"status": "error", "error": str(e)})
+
+    # Exploit mode (default)
+    goal = args.get("goal", "")
+    if not goal:
+        return json.dumps({"status": "error",
+                           "error": "goal is required for exploit mode"})
+    preferences = args.get("preferences", "")
+    max_steps = min(args.get("max_steps", 20), MENU_NAV_MAX_STEPS_CAP)
+    window_name = args.get("window_name")
+    try:
+        result = _menu_exploit_loop(goal, preferences, max_steps, window_name)
+        return json.dumps(result)
+    except Exception as e:
+        logger.exception("menu_navigate exploit error")
+        return json.dumps({"status": "error", "error": str(e)})
 
 
 def game_screenshot(args: dict, **kwargs) -> str:
@@ -814,4 +1517,65 @@ registry.register(
     check_fn=_check_game_requirements,
     emoji="🎮",
     description="Execute a complete game turn via OODA loop",
+)
+
+MENU_NAVIGATE_SCHEMA = {
+    "name": "menu_navigate",
+    "description": (
+        "Navigate application menus and dialogs, or explore an unfamiliar interface. "
+        "Two modes: 'exploit' (default) navigates to a goal; 'explore' maps the "
+        "interface for learning. Works with any application via vision + clicking."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "mode": {
+                "type": "string",
+                "enum": ["exploit", "explore"],
+                "description": (
+                    "'exploit' (default): navigate to a specific goal. "
+                    "'explore': systematically map an unfamiliar interface. "
+                    "Use explore when you have no memory/skill for this application."
+                ),
+            },
+            "goal": {
+                "type": "string",
+                "description": "Target screen/state to reach (required for exploit mode)",
+            },
+            "preferences": {
+                "type": "string",
+                "description": "Preferences for choices encountered (exploit mode)",
+            },
+            "context": {
+                "type": "string",
+                "description": (
+                    "What app and why you're exploring (explore mode). "
+                    "E.g. 'just launched FreeCiv for the first time'"
+                ),
+            },
+            "max_steps": {
+                "type": "integer",
+                "description": "Max screenshot-action cycles (default 20 exploit, 25 explore; cap 40)",
+            },
+            "max_depth": {
+                "type": "integer",
+                "description": "How many screens deep to explore (explore mode, default 3)",
+            },
+            "window_name": {
+                "type": "string",
+                "description": "Window name for xdotool focus (pipe-separated alternatives)",
+            },
+        },
+        "required": [],
+    },
+}
+
+registry.register(
+    name="menu_navigate",
+    toolset="gaming",
+    schema=MENU_NAVIGATE_SCHEMA,
+    handler=menu_navigate,
+    check_fn=_check_game_requirements,
+    emoji="🧭",
+    description="Navigate or explore application menus via vision",
 )

@@ -60,6 +60,8 @@ _HERMES_CORE_TOOLS = [
     "send_message",
     # Game-playing (screenshot, click, key via vision + xdotool)
     "game_screenshot", "game_click", "game_key", "game_turn",
+    # General UI navigation (vision + xdotool, works with any app)
+    "menu_navigate",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
 ]
