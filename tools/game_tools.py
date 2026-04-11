@@ -205,6 +205,15 @@ def _should_escalate(game_state_text, turn_number, force_review,
     state_lower = game_state_text.lower() if isinstance(game_state_text, str) else ""
     if any(kw in state_lower for kw in ESCALATION_KEYWORDS):
         return True
+    # Escalate on expectation mismatches
+    if '"mismatches": [' in game_state_text:
+        try:
+            state = json.loads(game_state_text) if isinstance(game_state_text, str) else {}
+            if state.get("mismatches"):
+                return True
+        except (json.JSONDecodeError, ValueError):
+            if "mismatch" in state_lower:
+                return True
     return False
 
 
@@ -340,28 +349,42 @@ def _execute_ui_action(action, full_w, full_h, window_name=None):
 _STATE_ANALYSIS_PROMPT = """\
 Analyze this game screenshot. Return ONLY a JSON object:
 {{
-  "screen_type": "main_map|city_view|dialog|menu|other",
+  "screen_type": "main_map|city_view|dialog|unit_selection|menu|other",
   "turn_info": "Turn N, Year",
-  "units_needing_orders": ["unit at (x,y)"],
+  "selected_unit": {{"type": "Settler|Warrior|...", "at": "(x,y)"}} or null,
+  "units_needing_orders": ["unit_type at (x,y)"],
+  "unit_count_on_tile": null,
+  "units_visible_in_panel": 0,
   "cities": [{{"name": "...", "production": "...", "turns_left": 0}}],
   "threats": [],
   "resources": {{"gold": 0, "researching": "Tech (N turns)"}},
   "notifications": [],
   "observations": [],
-  "surprise_level": "none|low|high"
+  "surprise_level": "none|low|high",
+  "mismatches": []
 }}
 
+IMPORTANT — Mismatch detection:
+- Check if a number on a map tile (e.g. "4") exceeds visible units in a panel/dialog
+- Check if the selected unit type matches what the strategy requires
+- Check if expected UI elements are missing or if dialogs need scrolling
+- Report ANY discrepancy between what you see and what you'd expect in "mismatches"
+  e.g. ["tile shows 4 units but only 3 visible in selection dialog",
+        "strategy says found city but selected unit is Diplomat not Settler"]
+
+STRATEGY CONTEXT: {strategy}
 Previous context: {prev_summary}
 Recent actions: {recent_actions}"""
 
 _ACTION_DECISION_PROMPT = """\
-You are executing a turn in a strategy game. Pick 3-5 actions.
+You are executing a turn in a strategy game. Pick 1-5 actions.
 
 STRATEGY: {strategy}
 {guidance_line}
 GAME STATE: {game_state}
 RECENT ACTIONS: {recent_actions}
 ACTION BUDGET: {remaining} remaining
+{game_knowledge_line}
 
 Return JSON:
 {{
@@ -370,12 +393,20 @@ Return JSON:
     {{"action": "key", "key": "xdotool key name"}},
     {{"action": "end_turn"}}
   ],
-  "turn_complete": false
+  "turn_complete": false,
+  "intent": "brief description of what this action sequence is trying to accomplish"
 }}
 
 Rules:
 - Max 5 actions per batch
 - Handle dialogs/popups FIRST (Escape or click Close)
+- VERIFY the correct unit is selected before issuing unit commands
+- If state reports mismatches, resolve them FIRST (e.g. scroll to find hidden \
+units, select the correct unit before acting)
+- Actions often require multi-step sequences. Think in terms of goals:
+  e.g. "found city" = select Settler → verify Settler is active → press B
+  e.g. "move unit" = select unit → press G (or movement key) → click destination
+- If a list or panel might have hidden items (count mismatch), try scrolling
 - Set turn_complete: true when all units have orders and turn should end"""
 
 _STRATEGIC_REVIEW_PROMPT = """\
@@ -391,7 +422,12 @@ Assess in under 150 words:
 make sense given what's happening on the ground? If the player is pursuing \
 a science victory but keeps winning wars, should they consider pivoting \
 to domination? If going military but falling behind in tech, reconsider?
-3. RECOMMENDATIONS: Enumerate priorities for the next 5-10 turns.
+3. MISMATCHES: If the game state reports mismatches (expected vs actual), \
+diagnose the likely cause and suggest specific actions to resolve them. \
+Common issues: hidden scrollbars in selection dialogs, wrong unit selected, \
+unit stacks where clicking a tile selects the wrong unit, UI elements that \
+require scrolling to reveal all options.
+4. RECOMMENDATIONS: Enumerate priorities for the next 5-10 turns.
 
 Your assessment will be returned to the player's high-level reasoning, \
 which may revise the grand strategy for future turns. Be direct."""
@@ -445,6 +481,9 @@ def _build_summary(action_log, final_state_text, turn_number, escalated,
             observations = state.get("observations", [])
             if observations:
                 parts.append("Observed: " + "; ".join(observations[:5]) + ".")
+            mismatches = state.get("mismatches", [])
+            if mismatches:
+                parts.append("MISMATCHES: " + "; ".join(mismatches[:3]) + ".")
         except (json.JSONDecodeError, AttributeError):
             pass
 
@@ -457,6 +496,13 @@ def _build_summary(action_log, final_state_text, turn_number, escalated,
         if len(strategic_guidance) > 300:
             guidance_short += "..."
         parts.append(f"STRATEGIC REVIEW: {guidance_short}")
+
+    # Suggest exploration if many actions failed
+    if errors > 0 and clicks > 0 and errors / max(clicks, 1) > 0.5:
+        parts.append(
+            "HINT: Many actions failed. Consider using menu_navigate in explore "
+            "mode to map available game actions before continuing."
+        )
 
     return " ".join(parts)
 
@@ -476,6 +522,7 @@ def game_turn(args: dict, **kwargs) -> str:
     force_review = args.get("force_strategic_review", False)
     max_actions = min(args.get("max_actions", 15), MAX_ACTIONS_HARD_CAP)
     prev_summary = args.get("previous_summary", "")
+    game_knowledge = args.get("game_knowledge", "")
 
     action_log = []
     total_actions = 0
@@ -498,6 +545,7 @@ def game_turn(args: dict, **kwargs) -> str:
 
             # ── ORIENT ── (Flash analyzes state)
             state_prompt = _STATE_ANALYSIS_PROMPT.format(
+                strategy=strategy,
                 prev_summary=prev_summary or "(none)",
                 recent_actions=json.dumps(
                     [{"action": a.get("action"), "target": a.get("target"),
@@ -522,6 +570,9 @@ def game_turn(args: dict, **kwargs) -> str:
             # ── DECIDE ── (Flash picks actions)
             guidance_line = (f"STRATEGIC GUIDANCE: {strategic_guidance}"
                             if strategic_guidance else "")
+            game_knowledge_line = (
+                f"GAME KNOWLEDGE:\n{game_knowledge}" if game_knowledge else ""
+            )
             decide_prompt = _ACTION_DECISION_PROMPT.format(
                 strategy=strategy,
                 guidance_line=guidance_line,
@@ -531,6 +582,7 @@ def game_turn(args: dict, **kwargs) -> str:
                       "key": a.get("key"), "status": a.get("result", {}).get("status")}
                      for a in action_log[-3:]]),
                 remaining=max_actions - total_actions,
+                game_knowledge_line=game_knowledge_line,
             )
             decide_text = _gemini_call(FLASH_MODEL, decide_prompt, img_b64)
             try:
@@ -1503,6 +1555,15 @@ GAME_TURN_SCHEMA = {
             "previous_summary": {
                 "type": "string",
                 "description": "Summary from previous game_turn call, for continuity",
+            },
+            "game_knowledge": {
+                "type": "string",
+                "description": (
+                    "Game-specific UI knowledge to help Flash make correct actions. "
+                    "Paste relevant skill content here — e.g. keybinds, how to select "
+                    "units, how menus work, multi-step action sequences. This is "
+                    "injected directly into Flash's decision prompt."
+                ),
             },
         },
         "required": ["strategy"],
