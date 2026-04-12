@@ -1570,12 +1570,17 @@ def game_screenshot(args: dict, **kwargs) -> str:
             prompt += f"\n\nContext: {context}"
 
         analysis = _gemini_call(PRO_MODEL, prompt, img_b64)
+        _region_str = f" region={region}" if region else ""
+        logger.info("game_screenshot: context=%r%s | %dx%d | analysis=%s",
+                     context or "(none)", _region_str, w, h,
+                     analysis[:200].replace("\n", " "))
         return json.dumps({
             "status": "ok",
             "resolution": f"{w}x{h}",
             "analysis": analysis,
         })
     except Exception as e:
+        logger.warning("game_screenshot error: %s", e)
         return json.dumps({"status": "error", "error": str(e)})
 
 
@@ -1592,8 +1597,14 @@ def game_click(args: dict, **kwargs) -> str:
     try:
         _, full_w, full_h = _capture_and_downscale()
         result = _precision_click(target, full_w, full_h, _focus_game_window)
+        logger.info("game_click: target=%r | %s at %s | confidence=%.2f%s",
+                     target, result.get("status", "?"),
+                     result.get("pixel", "?"),
+                     result.get("confidence", 0),
+                     " (zoomed)" if result.get("zoom_pass") else "")
         return json.dumps(result)
     except Exception as e:
+        logger.warning("game_click error: target=%r | %s", target, e)
         return json.dumps({"status": "error", "error": str(e)})
 
 
@@ -1616,8 +1627,10 @@ def game_key(args: dict, **kwargs) -> str:
             env=env, check=True,
         )
         time.sleep(0.3)
+        logger.info("game_key: %s | pressed", key)
         return json.dumps({"status": "pressed", "key": key})
     except Exception as e:
+        logger.warning("game_key error: %s | %s", key, e)
         return json.dumps({"status": "error", "error": str(e)})
 
 
