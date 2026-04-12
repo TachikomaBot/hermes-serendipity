@@ -340,12 +340,12 @@ def build_gemini_kwargs(
     if media_resolution:
         config_kwargs["media_resolution"] = media_resolution
 
-    # Thinking / reasoning
+    # Thinking / reasoning — use thinking_level (not thinking_budget;
+    # the API rejects requests that set both).
     if reasoning_config and reasoning_config.get("enabled"):
         effort = reasoning_config.get("effort", "medium")
         thinking_level = THINKING_LEVEL_MAP.get(effort, "medium")
         config_kwargs["thinking_config"] = types.ThinkingConfig(
-            thinking_budget=-1,  # automatic budget
             thinking_level=thinking_level,
         )
 
