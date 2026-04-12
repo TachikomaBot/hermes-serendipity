@@ -658,15 +658,19 @@ Return JSON:
   "intent": "brief description of what this action sequence is trying to accomplish"
 }}
 
-PRIORITY ORDER (you MUST follow this):
-1. STRATEGIC GUIDANCE is MANDATORY — if guidance says "change production" or \
-"open city screen", you must do that BEFORE handling units or ending turn. \
-Do NOT skip strategic directives to take shortcuts like n/x/end_turn.
+PRIORITY ORDER:
+1. Try to address STRATEGIC GUIDANCE first — e.g. if guidance says "change \
+production", try opening the city screen. But if you can't figure out how \
+after 1-2 attempts, MOVE ON to other actions. Never return zero actions.
 2. Handle dialogs/popups (Escape or click Close)
-3. Resolve mismatches reported in GAME STATE — e.g. wrong production, wrong \
-unit selected, hidden units. These take priority over routine unit orders.
-4. Then handle unit orders.
-5. Set turn_complete: true ONLY when all of the above are addressed.
+3. Resolve mismatches if you know how (e.g. scroll to find hidden units, \
+select the correct unit)
+4. Handle unit orders (n for next unit, give orders, repeat)
+5. End turn when units have orders
+
+CRITICAL: You must ALWAYS return at least 1 action. If you're unsure what \
+to do, fall back to: give orders to idle units (n/x), then end turn. \
+Never return an empty actions list — doing nothing is never correct.
 
 Other rules:
 - Max 5 actions per batch
@@ -676,8 +680,7 @@ Other rules:
   e.g. "change production" = double-click city → click Change Production → \
 select item → close city screen
   e.g. "move unit" = select unit → press G (or movement key) → click destination
-- If a list or panel might have hidden items (count mismatch), try scrolling
-- Do NOT end turn if strategic guidance hasn't been addressed yet"""
+- If a list or panel might have hidden items (count mismatch), try scrolling"""
 
 _STRATEGIC_REVIEW_PROMPT = """\
 You are a strategic advisor for a turn-based strategy game.
@@ -1540,25 +1543,33 @@ def menu_navigate(args: dict, **kwargs) -> str:
 def game_screenshot(args: dict, **kwargs) -> str:
     """Capture a screenshot of the game and return a description of the game state.
 
-    Sends the screenshot to Gemini Flash for analysis and returns a structured
-    text description of what's visible on screen.
+    Sends the full-resolution screenshot to Gemini Pro for analysis and returns
+    a detailed text description of what's visible on screen. Optionally zooms
+    into a region for closer inspection.
     """
     try:
-        img_b64, w, h = _capture_and_downscale()
-
         context = args.get("context", "")
+        region = args.get("region")
+
+        if region:
+            # Zoom into a specific region (normalized 0-1000 coords)
+            img_b64, w, h, _ = _capture_and_crop(region)
+        else:
+            img_b64, w, h = _capture_and_downscale()
+
         prompt = (
-            "Analyze this game screenshot. Describe:\n"
-            "1. What game is this and what screen/state are we on?\n"
-            "2. What units, cities, or UI elements are visible?\n"
-            "3. What resources, stats, or turn info can you read?\n"
-            "4. What actions are available right now?\n"
-            "Be specific and concise."
+            "Analyze this screenshot. Describe what you see:\n"
+            "- What screen, window, or view is this?\n"
+            "- What UI elements are visible (buttons, menus, tabs, panels)?\n"
+            "- What text, labels, numbers, or status info can you read?\n"
+            "- Are there any notifications, highlights, or elements that "
+            "seem to want attention?\n"
+            "Be specific and thorough. Read all visible text."
         )
         if context:
-            prompt += f"\n\nAdditional context: {context}"
+            prompt += f"\n\nContext: {context}"
 
-        analysis = _gemini_call(FLASH_MODEL, prompt, img_b64)
+        analysis = _gemini_call(PRO_MODEL, prompt, img_b64)
         return json.dumps({
             "status": "ok",
             "resolution": f"{w}x{h}",
@@ -1617,15 +1628,36 @@ def game_key(args: dict, **kwargs) -> str:
 GAME_SCREENSHOT_SCHEMA = {
     "name": "game_screenshot",
     "description": (
-        "Capture a screenshot of the game and get an AI analysis of the current "
-        "game state including units, cities, terrain, resources, and available actions."
+        "Capture a screenshot and get a detailed analysis of what's on screen. "
+        "Use context to ask specific questions about what you see. "
+        "Use region to zoom into a specific area for closer inspection."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "context": {
                 "type": "string",
-                "description": "Optional context to help analyze the screenshot (e.g. 'I just founded a city')",
+                "description": (
+                    "What you want to know or focus on. Examples: "
+                    "'what does the Diplomacy tab say?', "
+                    "'is a unit selected? which one?', "
+                    "'what are the menu options in the toolbar?', "
+                    "'I just clicked something, what changed?'"
+                ),
+            },
+            "region": {
+                "type": "object",
+                "description": (
+                    "Optional: zoom into a region for detail. Coordinates are "
+                    "normalized 0-1000. Example: {\"x0\": 0, \"y0\": 0, \"x1\": 200, \"y1\": 400} "
+                    "to zoom into the top-left panel."
+                ),
+                "properties": {
+                    "x0": {"type": "integer"},
+                    "y0": {"type": "integer"},
+                    "x1": {"type": "integer"},
+                    "y1": {"type": "integer"},
+                },
             },
         },
         "required": [],
