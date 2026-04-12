@@ -58,12 +58,14 @@ _HERMES_CORE_TOOLS = [
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
     "send_message",
-    # Game-playing (screenshot, click, key via vision + xdotool)
-    "game_screenshot", "game_click", "game_key", "game_turn",
-    # General UI navigation (vision + xdotool, works with any app)
-    "menu_navigate",
+    # GUI interaction (screenshot, click, key, scroll via vision + xdotool)
+    "gui_screenshot", "gui_click", "gui_key", "gui_scroll",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # Social media (gated on BLUESKY_HANDLE + atproto via check_fn)
+    "social_post", "social_reply", "social_quote",
+    "social_read_timeline", "social_read_thread", "social_read_profile",
+    "social_read_notifications", "social_like", "social_follow",
 ]
 
 
@@ -202,6 +204,16 @@ TOOLSETS = {
     "homeassistant": {
         "description": "Home Assistant smart home control and monitoring",
         "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service"],
+        "includes": []
+    },
+
+    "social": {
+        "description": "Social media posting, reading, and engagement",
+        "tools": [
+            "social_post", "social_reply", "social_quote",
+            "social_read_timeline", "social_read_thread", "social_read_profile",
+            "social_read_notifications", "social_like", "social_follow",
+        ],
         "includes": []
     },
 

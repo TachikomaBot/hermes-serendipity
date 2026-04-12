@@ -1,7 +1,8 @@
-"""Game-playing tools for Serendipity.
+"""GUI interaction tools for Serendipity.
 
 Provides screenshot capture, visual element clicking, keyboard input,
-and game state analysis via Gemini vision — all callable as Hermes tools.
+scroll wheel, and higher-level game/menu automation via Gemini vision —
+all callable as Hermes tools.  Works with any X11 GUI application.
 """
 
 import base64
@@ -244,8 +245,8 @@ ESCALATION_KEYWORDS = [
 ]
 
 
-def _check_game_requirements() -> bool:
-    """Check if game tools can run (Xvfb, xdotool, imagemagick)."""
+def _check_gui_requirements() -> bool:
+    """Check if GUI tools can run (X11 display, xdotool, imagemagick)."""
     try:
         for cmd in ["xdotool", "import", "identify"]:
             subprocess.run(
@@ -256,7 +257,7 @@ def _check_game_requirements() -> bool:
         return False
 
 
-def _focus_window(window_name=None):
+def _focus_window_by_name(window_name=None):
     """Focus a window by name, or no-op if None (use whatever is active)."""
     if window_name is None:
         return True
@@ -278,9 +279,9 @@ def _focus_window(window_name=None):
     return False
 
 
-def _focus_game_window():
+def _focus_window():
     """Focus the active game window before sending input."""
-    return _focus_window("Freeciv|Unciv")
+    return _focus_window_by_name("Freeciv|Unciv")
 
 
 def _capture_and_downscale(target_w=None, target_h=None):
@@ -564,7 +565,7 @@ def _execute_action(action, full_w, full_h):
     act_type = action.get("action", "")
 
     if act_type == "end_turn":
-        _focus_game_window()
+        _focus_window()
         env = {**os.environ, "DISPLAY": DISPLAY}
         subprocess.run(["xdotool", "key", "Shift+Return"], env=env, check=True)
         _time.sleep(0.5)
@@ -574,7 +575,7 @@ def _execute_action(action, full_w, full_h):
         key = _normalize_key(action.get("key", ""))
         if not key:
             return {"status": "error", "error": "no key specified"}
-        _focus_game_window()
+        _focus_window()
         env = {**os.environ, "DISPLAY": DISPLAY}
         subprocess.run(["xdotool", "key", key], env=env, check=True)
         _time.sleep(0.3)
@@ -585,7 +586,7 @@ def _execute_action(action, full_w, full_h):
         if not target:
             return {"status": "error", "error": "no click target"}
         try:
-            return _precision_click(target, full_w, full_h, _focus_game_window)
+            return _precision_click(target, full_w, full_h, _focus_window)
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
@@ -1562,7 +1563,7 @@ def menu_navigate(args: dict, **kwargs) -> str:
 _TOOL_SETTLE_DELAY = 1.2  # seconds — let the game render before next action
 
 
-def game_screenshot(args: dict, **kwargs) -> str:
+def gui_screenshot(args: dict, **kwargs) -> str:
     """Capture a screenshot and return it with a brief text summary.
 
     The raw screenshot is included as ``_image`` in the result JSON so the
@@ -1594,7 +1595,7 @@ def game_screenshot(args: dict, **kwargs) -> str:
         brief = _gemini_call(FLASH_MODEL, summary_prompt, img_b64)
 
         _region_str = f" region={region}" if region else ""
-        logger.info("game_screenshot: context=%r%s | %dx%d | %s",
+        logger.info("gui_screenshot: context=%r%s | %dx%d | %s",
                      context or "(none)", _region_str, w, h,
                      brief[:150].replace("\n", " "))
 
@@ -1613,7 +1614,7 @@ def game_screenshot(args: dict, **kwargs) -> str:
         return json.dumps({"status": "error", "error": str(e)})
 
 
-def game_click(args: dict, **kwargs) -> str:
+def gui_click(args: dict, **kwargs) -> str:
     """Click on a game UI element identified by visual description.
 
     Uses two-pass precision click via Flash: full screenshot to locate,
@@ -1625,9 +1626,9 @@ def game_click(args: dict, **kwargs) -> str:
 
     try:
         _, full_w, full_h = _capture_and_downscale()
-        result = _precision_click(target, full_w, full_h, _focus_game_window)
+        result = _precision_click(target, full_w, full_h, _focus_window)
         import time
-        logger.info("game_click: target=%r | %s at %s | confidence=%.2f%s",
+        logger.info("gui_click: target=%r | %s at %s | confidence=%.2f%s",
                      target, result.get("status", "?"),
                      result.get("pixel", "?"),
                      result.get("confidence", 0),
@@ -1639,7 +1640,7 @@ def game_click(args: dict, **kwargs) -> str:
         return json.dumps({"status": "error", "error": str(e)})
 
 
-def game_key(args: dict, **kwargs) -> str:
+def gui_key(args: dict, **kwargs) -> str:
     """Press a keyboard key in the game window.
 
     Uses xdotool key names (e.g. "b" for build city, "Return" for enter,
@@ -1651,21 +1652,21 @@ def game_key(args: dict, **kwargs) -> str:
         return json.dumps({"status": "error", "error": "key is required"})
 
     try:
-        _focus_game_window()
+        _focus_window()
         env = {**os.environ, "DISPLAY": DISPLAY}
         subprocess.run(
             ["xdotool", "key", key],
             env=env, check=True,
         )
         time.sleep(_TOOL_SETTLE_DELAY)  # let the game process the keypress
-        logger.info("game_key: %s | pressed", key)
+        logger.info("gui_key: %s | pressed", key)
         return json.dumps({"status": "pressed", "key": key})
     except Exception as e:
         logger.warning("game_key error: %s | %s", key, e)
         return json.dumps({"status": "error", "error": str(e)})
 
 
-def game_scroll(args: dict, **kwargs) -> str:
+def gui_scroll(args: dict, **kwargs) -> str:
     """Scroll the mouse wheel in the game window.
 
     Useful for scrolling through lists, menus, help pages, and any
@@ -1683,7 +1684,7 @@ def game_scroll(args: dict, **kwargs) -> str:
         button = "5"
 
     try:
-        _focus_game_window()
+        _focus_window()
         env = {**os.environ, "DISPLAY": DISPLAY}
         for _ in range(amount):
             subprocess.run(
@@ -1691,7 +1692,7 @@ def game_scroll(args: dict, **kwargs) -> str:
                 env=env, check=True,
             )
         time.sleep(_TOOL_SETTLE_DELAY)
-        logger.info("game_scroll: %s x%d", direction, amount)
+        logger.info("gui_scroll: %s x%d", direction, amount)
         return json.dumps({"status": "scrolled", "direction": direction, "amount": amount})
     except Exception as e:
         logger.warning("game_scroll error: %s", e)
@@ -1702,12 +1703,13 @@ def game_scroll(args: dict, **kwargs) -> str:
 # Schemas
 # ---------------------------------------------------------------------------
 
-GAME_SCREENSHOT_SCHEMA = {
-    "name": "game_screenshot",
+GUI_SCREENSHOT_SCHEMA = {
+    "name": "gui_screenshot",
     "description": (
-        "Capture a screenshot and get a detailed analysis of what's on screen. "
+        "Capture a screenshot of the active window and get a detailed analysis of what's on screen. "
         "Use context to ask specific questions about what you see. "
-        "Use region to zoom into a specific area for closer inspection."
+        "Use region to zoom into a specific area for closer inspection. "
+        "Includes a built-in render delay — do not add sleep commands between gui tool calls."
     ),
     "parameters": {
         "type": "object",
@@ -1741,13 +1743,14 @@ GAME_SCREENSHOT_SCHEMA = {
     },
 }
 
-GAME_CLICK_SCHEMA = {
-    "name": "game_click",
+GUI_CLICK_SCHEMA = {
+    "name": "gui_click",
     "description": (
-        "Click on a game UI element by visual description. Takes a screenshot, "
+        "Click on a UI element by visual description. Takes a screenshot, "
         "uses vision to locate the element, and clicks it. "
-        "Examples: 'the Start New Game button', 'my settler unit', "
-        "'the production menu', 'the End Turn button'."
+        "Examples: 'the Start New Game button', 'the OK button', "
+        "'the File menu', 'the submit button'. "
+        "Includes a built-in render delay — do not add sleep commands between gui tool calls."
     ),
     "parameters": {
         "type": "object",
@@ -1761,12 +1764,13 @@ GAME_CLICK_SCHEMA = {
     },
 }
 
-GAME_SCROLL_SCHEMA = {
-    "name": "game_scroll",
+GUI_SCROLL_SCHEMA = {
+    "name": "gui_scroll",
     "description": (
-        "Scroll the mouse wheel in the game window. Use to scroll through "
-        "lists, menus, help pages, unit selection dialogs, and any "
-        "scrollable content. Default is 3 scroll steps."
+        "Scroll the mouse wheel in the active window. Use to scroll through "
+        "lists, menus, help pages, dialogs, and any scrollable content. "
+        "Default is 3 scroll steps. "
+        "Includes a built-in render delay — do not add sleep commands between gui tool calls."
     ),
     "parameters": {
         "type": "object",
@@ -1785,12 +1789,13 @@ GAME_SCROLL_SCHEMA = {
     },
 }
 
-GAME_KEY_SCHEMA = {
-    "name": "game_key",
+GUI_KEY_SCHEMA = {
+    "name": "gui_key",
     "description": (
-        "Press a keyboard key in the game window. Uses xdotool key names. "
-        "Common game keys: 'b' = build/found city (FreeCiv), 'space' = wait, "
-        "'x' = auto-explore, 'Return' = end turn/confirm, 'Escape' = cancel."
+        "Press a keyboard key in the active window. Uses xdotool key names. "
+        "Examples: 'Return' = enter/confirm, 'Escape' = cancel, 'Tab' = next field, "
+        "'space' = toggle/select, 'ctrl+s' = save, 'ctrl+z' = undo. "
+        "Includes a built-in render delay — do not add sleep commands between gui tool calls."
     ),
     "parameters": {
         "type": "object",
@@ -1811,43 +1816,43 @@ GAME_KEY_SCHEMA = {
 from tools.registry import registry
 
 registry.register(
-    name="game_screenshot",
-    toolset="gaming",
-    schema=GAME_SCREENSHOT_SCHEMA,
-    handler=game_screenshot,
-    check_fn=_check_game_requirements,
+    name="gui_screenshot",
+    toolset="gui",
+    schema=GUI_SCREENSHOT_SCHEMA,
+    handler=gui_screenshot,
+    check_fn=_check_gui_requirements,
     emoji="📸",
-    description="Capture and analyze a game screenshot",
+    description="Capture and analyze a screenshot of the active window",
 )
 
 registry.register(
-    name="game_click",
-    toolset="gaming",
-    schema=GAME_CLICK_SCHEMA,
-    handler=game_click,
-    check_fn=_check_game_requirements,
+    name="gui_click",
+    toolset="gui",
+    schema=GUI_CLICK_SCHEMA,
+    handler=gui_click,
+    check_fn=_check_gui_requirements,
     emoji="🖱️",
-    description="Click a game UI element by visual description",
+    description="Click a UI element by visual description",
 )
 
 registry.register(
-    name="game_key",
-    toolset="gaming",
-    schema=GAME_KEY_SCHEMA,
-    handler=game_key,
-    check_fn=_check_game_requirements,
+    name="gui_key",
+    toolset="gui",
+    schema=GUI_KEY_SCHEMA,
+    handler=gui_key,
+    check_fn=_check_gui_requirements,
     emoji="⌨️",
-    description="Press a keyboard key in the game",
+    description="Press a keyboard key in the active window",
 )
 
 registry.register(
-    name="game_scroll",
-    toolset="gaming",
-    schema=GAME_SCROLL_SCHEMA,
-    handler=game_scroll,
-    check_fn=_check_game_requirements,
+    name="gui_scroll",
+    toolset="gui",
+    schema=GUI_SCROLL_SCHEMA,
+    handler=gui_scroll,
+    check_fn=_check_gui_requirements,
     emoji="🔄",
-    description="Scroll the mouse wheel in the game",
+    description="Scroll the mouse wheel in the active window",
 )
 
 GAME_TURN_SCHEMA = {
@@ -1906,7 +1911,7 @@ registry.register(
     toolset="gaming",
     schema=GAME_TURN_SCHEMA,
     handler=game_turn,
-    check_fn=_check_game_requirements,
+    check_fn=_check_gui_requirements,
     emoji="🎮",
     description="Execute a complete game turn via OODA loop",
 )
@@ -1967,7 +1972,7 @@ registry.register(
     toolset="gaming",
     schema=MENU_NAVIGATE_SCHEMA,
     handler=menu_navigate,
-    check_fn=_check_game_requirements,
+    check_fn=_check_gui_requirements,
     emoji="🧭",
     description="Navigate or explore application menus via vision",
 )

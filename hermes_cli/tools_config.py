@@ -65,13 +65,14 @@ CONFIGURABLE_TOOLSETS = [
     ("cronjob",         "⏰ Cron Jobs",                 "create/list/update/pause/resume/run, with optional attached skills"),
     ("rl",              "🧪 RL Training",               "Tinker-Atropos training tools"),
     ("homeassistant",    "🏠 Home Assistant",           "smart home device control"),
-    ("gaming",           "🎮 Game Playing",             "screenshot, click, key via vision + xdotool"),
+    ("gui",              "🖥️  GUI Interaction",           "screenshot, click, key, scroll via vision + xdotool"),
+    ("social",           "📱 Social Media",              "post, reply, quote, read feeds, notifications, like, follow"),
 ]
 
 # Toolsets that are OFF by default for new installs.
 # They're still in _HERMES_CORE_TOOLS (available at runtime if enabled),
 # but the setup checklist won't pre-select them for first-time users.
-_DEFAULT_OFF_TOOLSETS = {"moa", "homeassistant", "rl"}
+_DEFAULT_OFF_TOOLSETS = {"moa", "homeassistant", "rl", "social"}
 
 
 def _get_effective_configurable_toolsets():

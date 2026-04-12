@@ -46,6 +46,7 @@ messaging = ["python-telegram-bot[webhooks]>=22.6,<23", "discord.py[voice]>=2.7.
 cron = ["croniter>=6.0.0,<7"]
 slack = ["slack-bolt>=1.18.0,<2", "slack-sdk>=3.27.0,<4"]
 matrix = ["mautrix[encryption]>=0.20,<1", "Markdown>=3.6,<4", "aiosqlite>=0.20", "asyncpg>=0.29"]
+social = ["atproto>=0.0.55,<1"]
 cli = ["simple-term-menu>=1.0,<2"]
 tts-premium = ["elevenlabs>=1.0,<2"]
 voice = [
