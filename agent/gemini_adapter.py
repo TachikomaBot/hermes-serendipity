@@ -338,6 +338,14 @@ def build_gemini_kwargs(
     # Build GenerateContentConfig
     config_kwargs: Dict[str, Any] = {}
 
+    # CRITICAL: Disable the SDK's Automatic Function Calling.
+    # AFC makes the SDK execute tool calls internally in a loop (up to 10
+    # rounds), which blocks for minutes and bypasses the harness's own
+    # tool-call handling entirely.  We handle tool calls ourselves.
+    config_kwargs["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(
+        disable=True,
+    )
+
     if system_instruction:
         config_kwargs["system_instruction"] = system_instruction
 

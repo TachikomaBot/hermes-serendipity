@@ -73,6 +73,10 @@ class _MockTypes:
             self.thinking_budget = thinking_budget
             self.thinking_level = thinking_level
 
+    class AutomaticFunctionCallingConfig:
+        def __init__(self, disable=False, **kwargs):
+            self.disable = disable
+
     class HttpOptions:
         def __init__(self, api_version="v1"):
             self.api_version = api_version
