@@ -346,9 +346,8 @@ def build_gemini_kwargs(
         thinking_level = THINKING_LEVEL_MAP.get(effort, "medium")
         config_kwargs["thinking_config"] = types.ThinkingConfig(
             thinking_budget=-1,  # automatic budget
+            thinking_level=thinking_level,
         )
-        # thinkingLevel is set via config
-        config_kwargs["thinking_level"] = thinking_level
 
     # Flex inference
     if flex_mode:

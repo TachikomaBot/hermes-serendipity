@@ -62,8 +62,9 @@ class _MockTypes:
                 setattr(self, k, v)
 
     class ThinkingConfig:
-        def __init__(self, thinking_budget=-1):
+        def __init__(self, thinking_budget=-1, thinking_level=None):
             self.thinking_budget = thinking_budget
+            self.thinking_level = thinking_level
 
     class HttpOptions:
         def __init__(self, api_version="v1"):
@@ -359,8 +360,7 @@ class TestBuildGeminiKwargs:
         )
         config = kwargs["config"]
         assert hasattr(config, "thinking_config")
-        assert hasattr(config, "thinking_level")
-        assert config.thinking_level == "high"
+        assert config.thinking_config.thinking_level == "high"
 
     def test_thinking_xhigh_maps_to_high(self):
         kwargs = gad.build_gemini_kwargs(
@@ -368,7 +368,7 @@ class TestBuildGeminiKwargs:
             messages=[{"role": "user", "content": "x"}],
             reasoning_config={"enabled": True, "effort": "xhigh"},
         )
-        assert kwargs["config"].thinking_level == "high"
+        assert kwargs["config"].thinking_config.thinking_level == "high"
 
     def test_flex_mode(self):
         kwargs = gad.build_gemini_kwargs(
