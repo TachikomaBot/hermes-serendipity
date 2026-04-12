@@ -1665,6 +1665,39 @@ def game_key(args: dict, **kwargs) -> str:
         return json.dumps({"status": "error", "error": str(e)})
 
 
+def game_scroll(args: dict, **kwargs) -> str:
+    """Scroll the mouse wheel in the game window.
+
+    Useful for scrolling through lists, menus, help pages, and any
+    scrollable content in the game UI.
+    """
+    import time
+    direction = args.get("direction", "down").lower()
+    amount = args.get("amount", 3)
+    amount = max(1, min(int(amount), 20))
+
+    # Map direction to xdotool button: 4=up, 5=down
+    if direction == "up":
+        button = "4"
+    else:
+        button = "5"
+
+    try:
+        _focus_game_window()
+        env = {**os.environ, "DISPLAY": DISPLAY}
+        for _ in range(amount):
+            subprocess.run(
+                ["xdotool", "click", button],
+                env=env, check=True,
+            )
+        time.sleep(_TOOL_SETTLE_DELAY)
+        logger.info("game_scroll: %s x%d", direction, amount)
+        return json.dumps({"status": "scrolled", "direction": direction, "amount": amount})
+    except Exception as e:
+        logger.warning("game_scroll error: %s", e)
+        return json.dumps({"status": "error", "error": str(e)})
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -1728,6 +1761,30 @@ GAME_CLICK_SCHEMA = {
     },
 }
 
+GAME_SCROLL_SCHEMA = {
+    "name": "game_scroll",
+    "description": (
+        "Scroll the mouse wheel in the game window. Use to scroll through "
+        "lists, menus, help pages, unit selection dialogs, and any "
+        "scrollable content. Default is 3 scroll steps."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "direction": {
+                "type": "string",
+                "enum": ["up", "down"],
+                "description": "Scroll direction (default: down)",
+            },
+            "amount": {
+                "type": "integer",
+                "description": "Number of scroll steps (1-20, default: 3)",
+            },
+        },
+        "required": [],
+    },
+}
+
 GAME_KEY_SCHEMA = {
     "name": "game_key",
     "description": (
@@ -1781,6 +1838,16 @@ registry.register(
     check_fn=_check_game_requirements,
     emoji="⌨️",
     description="Press a keyboard key in the game",
+)
+
+registry.register(
+    name="game_scroll",
+    toolset="gaming",
+    schema=GAME_SCROLL_SCHEMA,
+    handler=game_scroll,
+    check_fn=_check_game_requirements,
+    emoji="🔄",
+    description="Scroll the mouse wheel in the game",
 )
 
 GAME_TURN_SCHEMA = {
