@@ -1559,6 +1559,9 @@ def menu_navigate(args: dict, **kwargs) -> str:
         return json.dumps({"status": "error", "error": str(e)})
 
 
+_TOOL_SETTLE_DELAY = 1.2  # seconds — let the game render before next action
+
+
 def game_screenshot(args: dict, **kwargs) -> str:
     """Capture a screenshot and return it with a brief text summary.
 
@@ -1567,6 +1570,9 @@ def game_screenshot(args: dict, **kwargs) -> str:
     Flash-generated summary is included for logging and as a fallback for
     non-vision providers.  Optionally zooms into a region.
     """
+    import time
+    # Wait for any preceding action (click/keypress) to render
+    time.sleep(_TOOL_SETTLE_DELAY)
     try:
         context = args.get("context", "")
         region = args.get("region")
@@ -1620,11 +1626,13 @@ def game_click(args: dict, **kwargs) -> str:
     try:
         _, full_w, full_h = _capture_and_downscale()
         result = _precision_click(target, full_w, full_h, _focus_game_window)
+        import time
         logger.info("game_click: target=%r | %s at %s | confidence=%.2f%s",
                      target, result.get("status", "?"),
                      result.get("pixel", "?"),
                      result.get("confidence", 0),
                      " (zoomed)" if result.get("zoom_pass") else "")
+        time.sleep(_TOOL_SETTLE_DELAY)  # let the UI respond before next action
         return json.dumps(result)
     except Exception as e:
         logger.warning("game_click error: target=%r | %s", target, e)
@@ -1649,7 +1657,7 @@ def game_key(args: dict, **kwargs) -> str:
             ["xdotool", "key", key],
             env=env, check=True,
         )
-        time.sleep(0.3)
+        time.sleep(_TOOL_SETTLE_DELAY)  # let the game process the keypress
         logger.info("game_key: %s | pressed", key)
         return json.dumps({"status": "pressed", "key": key})
     except Exception as e:
