@@ -217,7 +217,17 @@ def convert_messages_to_gemini(
                 # FunctionCall() does — and we need to preserve it
                 # for tool_call_id matching on round-trip.
                 fc = types.FunctionCall(name=name, id=tc_id, args=args)
-                parts.append(types.Part(function_call=fc))
+                part_kwargs = {"function_call": fc}
+                # Replay thought_signature if present (Gemini 3 requirement
+                # for tool call round-trips — see ai.google.dev/gemini-api/docs/thought-signatures)
+                thought_sig = None
+                if isinstance(tc, dict):
+                    thought_sig = tc.get("_thought_signature")
+                else:
+                    thought_sig = getattr(tc, "_thought_signature", None)
+                if thought_sig is not None:
+                    part_kwargs["thought_signature"] = thought_sig
+                parts.append(types.Part(**part_kwargs))
 
             # Gemini rejects empty model content
             if not parts:
@@ -414,6 +424,9 @@ def normalize_gemini_response(response) -> Tuple[SimpleNamespace, str]:
             if fc is not None:
                 fc_id = getattr(fc, "id", None) or f"call_{uuid.uuid4().hex[:8]}"
                 fc_args = getattr(fc, "args", {}) or {}
+                # Preserve thought_signature for round-trip (Gemini 3 requirement).
+                # The signature is on the Part, not the FunctionCall.
+                thought_sig = getattr(part, "thought_signature", None)
                 tool_calls.append(
                     SimpleNamespace(
                         id=fc_id,
@@ -422,6 +435,7 @@ def normalize_gemini_response(response) -> Tuple[SimpleNamespace, str]:
                             name=getattr(fc, "name", ""),
                             arguments=json.dumps(fc_args),
                         ),
+                        _thought_signature=thought_sig,
                     )
                 )
                 continue

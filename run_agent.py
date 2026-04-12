@@ -6432,6 +6432,10 @@ class AIAgent:
                     if hasattr(extra, "model_dump"):
                         extra = extra.model_dump()
                     tc_dict["extra_content"] = extra
+                # Preserve Gemini thought_signature for native adapter round-trip.
+                thought_sig = getattr(tool_call, "_thought_signature", None)
+                if thought_sig is not None:
+                    tc_dict["_thought_signature"] = thought_sig
                 tool_calls.append(tc_dict)
             msg["tool_calls"] = tool_calls
 
