@@ -829,6 +829,7 @@ class AIAgent:
         # access for Codex Responses API streaming.
         self._anthropic_client = None
         self._is_anthropic_oauth = False
+        self._gemini_client = None
 
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
@@ -850,6 +851,14 @@ class AIAgent:
                 print(f"🤖 AI Agent initialized with model: {self.model} (Anthropic native)")
                 if effective_key and len(effective_key) > 12:
                     print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
+        elif self.api_mode == "google_genai":
+            from agent.gemini_adapter import build_gemini_client
+            self._gemini_client = build_gemini_client(api_key=api_key or "")
+            # No OpenAI client needed for native Gemini mode
+            self.client = None
+            self._client_kwargs = {}
+            if not self.quiet_mode:
+                print(f"🤖 AI Agent initialized with model: {self.model} (Gemini native)")
         else:
             if api_key and base_url:
                 # Explicit credentials from CLI/gateway — construct directly.
@@ -4668,6 +4677,54 @@ class AIAgent:
             self._try_refresh_anthropic_client_credentials()
         return self._anthropic_client.messages.create(**api_kwargs)
 
+    def _gemini_generate_content(self, api_kwargs: dict):
+        """Call the native Gemini generateContent API with streaming.
+
+        Streams text deltas to the display, accumulates the full response,
+        and returns a normalized response object.
+        """
+        from agent.gemini_adapter import accumulate_streaming_response
+
+        stream = self._gemini_client.models.generate_content_stream(**api_kwargs)
+        all_parts = []
+        final_candidate = None
+        final_usage = None
+        has_tool_use = False
+
+        for chunk in stream:
+            candidates = getattr(chunk, "candidates", None)
+            if candidates:
+                final_candidate = candidates[0]
+                content = getattr(final_candidate, "content", None)
+                if content and content.parts:
+                    for part in content.parts:
+                        all_parts.append(part)
+                        if getattr(part, "thought", False):
+                            text = getattr(part, "text", "")
+                            if text:
+                                self._fire_reasoning_delta(text)
+                        elif getattr(part, "function_call", None) is not None:
+                            has_tool_use = True
+                            fc_name = getattr(part.function_call, "name", "")
+                            if fc_name:
+                                self._fire_tool_gen_started(fc_name)
+                        elif getattr(part, "text", None):
+                            if not has_tool_use:
+                                self._fire_stream_delta(part.text)
+            usage = getattr(chunk, "usage_metadata", None)
+            if usage:
+                final_usage = usage
+
+        # Build synthetic response compatible with normalize_gemini_response
+        from types import SimpleNamespace as _NS
+        return _NS(
+            candidates=[_NS(
+                content=_NS(parts=all_parts),
+                finish_reason=getattr(final_candidate, "finish_reason", None) if final_candidate else None,
+            )] if all_parts or final_candidate else [],
+            usage_metadata=final_usage,
+        )
+
     def _interruptible_api_call(self, api_kwargs: dict):
         """
         Run the API call in a background thread so the main conversation loop
@@ -4691,6 +4748,8 @@ class AIAgent:
                     )
                 elif self.api_mode == "anthropic_messages":
                     result["response"] = self._anthropic_messages_create(api_kwargs)
+                elif self.api_mode == "google_genai":
+                    result["response"] = self._gemini_generate_content(api_kwargs)
                 else:
                     request_client_holder["client"] = self._create_request_openai_client(reason="chat_completion_request")
                     result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
@@ -5151,6 +5210,8 @@ class AIAgent:
                         if self.api_mode == "anthropic_messages":
                             self._try_refresh_anthropic_client_credentials()
                             result["response"] = _call_anthropic()
+                        elif self.api_mode == "google_genai":
+                            result["response"] = self._gemini_generate_content(stream_kwargs)
                         else:
                             result["response"] = _call_chat_completions()
                         return  # success
@@ -5928,6 +5989,21 @@ class AIAgent:
                 fast_mode=(self.request_overrides or {}).get("speed") == "fast",
             )
 
+        if self.api_mode == "google_genai":
+            from agent.gemini_adapter import build_gemini_kwargs
+            system_prompt = ""
+            if api_messages and api_messages[0].get("role") == "system":
+                system_prompt = str(api_messages[0].get("content") or "")
+            return build_gemini_kwargs(
+                model=self.model,
+                messages=api_messages,
+                tools=self.tools,
+                max_tokens=self.max_tokens,
+                reasoning_config=self.reasoning_config,
+                system_prompt=system_prompt,
+                temperature=self.temperature if hasattr(self, "temperature") else None,
+            )
+
         if self.api_mode == "codex_responses":
             instructions = ""
             payload_messages = api_messages
@@ -6505,6 +6581,15 @@ class AIAgent:
                     preserve_dots=self._anthropic_preserve_dots(),
                 )
                 response = self._anthropic_messages_create(ant_kwargs)
+            elif not _aux_available and self.api_mode == "google_genai":
+                # Native Gemini — use the Gemini client directly
+                from agent.gemini_adapter import build_gemini_kwargs as _build_gem_kwargs
+                gem_kwargs = _build_gem_kwargs(
+                    model=self.model, messages=api_messages,
+                    tools=[memory_tool_def], max_tokens=5120,
+                    reasoning_config=None,
+                )
+                response = self._gemini_generate_content(gem_kwargs)
             elif not _aux_available:
                 api_kwargs = {
                     "model": self.model,
@@ -6527,6 +6612,11 @@ class AIAgent:
             elif self.api_mode == "anthropic_messages" and not _aux_available:
                 from agent.anthropic_adapter import normalize_anthropic_response as _nar_flush
                 _flush_msg, _ = _nar_flush(response, strip_tool_prefix=self._is_anthropic_oauth)
+                if _flush_msg and _flush_msg.tool_calls:
+                    tool_calls = _flush_msg.tool_calls
+            elif self.api_mode == "google_genai" and not _aux_available:
+                from agent.gemini_adapter import normalize_gemini_response as _nar_gem_flush
+                _flush_msg, _ = _nar_gem_flush(response)
                 if _flush_msg and _flush_msg.tool_calls:
                     tool_calls = _flush_msg.tool_calls
             elif hasattr(response, "choices") and response.choices:
@@ -6967,15 +7057,17 @@ class AIAgent:
             if subdir_hints:
                 function_result += subdir_hints
 
-            # ── Convert to multipart if image present ──
-            from tools.multipart_tool_result import extract_multipart_content
-            function_result = extract_multipart_content(function_result, provider=self.provider)
+            # ── Extract image from tool result (if present) ──
+            from tools.multipart_tool_result import extract_image_from_result
+            function_result, _image_data = extract_image_from_result(function_result, provider=self.provider)
 
             tool_msg = {
                 "role": "tool",
                 "content": function_result,
                 "tool_call_id": tc.id,
             }
+            if _image_data is not None:
+                tool_msg["_image"] = _image_data  # Native adapter handles this
             messages.append(tool_msg)
 
         # ── Per-turn aggregate budget enforcement ─────────────────────────
@@ -7294,19 +7386,21 @@ class AIAgent:
             if subdir_hints:
                 function_result += subdir_hints
 
-            # ── Convert to multipart if image present ──
-            from tools.multipart_tool_result import extract_multipart_content
-            function_result = extract_multipart_content(function_result, provider=self.provider)
+            # ── Extract image from tool result (if present) ──
+            from tools.multipart_tool_result import extract_image_from_result
+            function_result, _image_data = extract_image_from_result(function_result, provider=self.provider)
 
             tool_msg = {
                 "role": "tool",
                 "content": function_result,
                 "tool_call_id": tool_call.id
             }
+            if _image_data is not None:
+                tool_msg["_image"] = _image_data  # Native adapter handles this
             messages.append(tool_msg)
 
             if not self.quiet_mode:
-                _log_result = str(function_result) if isinstance(function_result, list) else function_result
+                _log_result = function_result
                 if self.verbose_logging:
                     print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
                     print(f"     Result: {_log_result[:500]}")
@@ -7462,6 +7556,13 @@ class AIAgent:
                     summary_response = self._anthropic_messages_create(_ant_kw)
                     _msg, _ = _nar(summary_response, strip_tool_prefix=self._is_anthropic_oauth)
                     final_response = (_msg.content or "").strip()
+                elif self.api_mode == "google_genai":
+                    from agent.gemini_adapter import build_gemini_kwargs as _bgk, normalize_gemini_response as _ngr
+                    _gem_kw = _bgk(model=self.model, messages=api_messages, tools=None,
+                                   max_tokens=self.max_tokens, reasoning_config=self.reasoning_config)
+                    summary_response = self._gemini_generate_content(_gem_kw)
+                    _msg, _ = _ngr(summary_response)
+                    final_response = (_msg.content or "").strip()
                 else:
                     summary_response = self._ensure_primary_openai_client(reason="iteration_limit_summary").chat.completions.create(**summary_kwargs)
 
@@ -7493,6 +7594,13 @@ class AIAgent:
                                     preserve_dots=self._anthropic_preserve_dots())
                     retry_response = self._anthropic_messages_create(_ant_kw2)
                     _retry_msg, _ = _nar2(retry_response, strip_tool_prefix=self._is_anthropic_oauth)
+                    final_response = (_retry_msg.content or "").strip()
+                elif self.api_mode == "google_genai":
+                    from agent.gemini_adapter import build_gemini_kwargs as _bgk2, normalize_gemini_response as _ngr2
+                    _gem_kw2 = _bgk2(model=self.model, messages=api_messages, tools=None,
+                                    max_tokens=self.max_tokens, reasoning_config=self.reasoning_config)
+                    retry_response = self._gemini_generate_content(_gem_kw2)
+                    _retry_msg, _ = _ngr2(retry_response)
                     final_response = (_retry_msg.content or "").strip()
                 else:
                     summary_kwargs = {
@@ -9356,6 +9464,9 @@ class AIAgent:
                     assistant_message, finish_reason = normalize_anthropic_response(
                         response, strip_tool_prefix=self._is_anthropic_oauth
                     )
+                elif self.api_mode == "google_genai":
+                    from agent.gemini_adapter import normalize_gemini_response
+                    assistant_message, finish_reason = normalize_gemini_response(response)
                 else:
                     assistant_message = response.choices[0].message
                 

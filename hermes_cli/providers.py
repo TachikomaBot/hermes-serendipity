@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 class HermesOverlay:
     """Hermes-specific provider metadata layered on top of models.dev."""
 
-    transport: str = "openai_chat"        # openai_chat | anthropic_messages | codex_responses
+    transport: str = "openai_chat"        # openai_chat | anthropic_messages | codex_responses | google_genai
     is_aggregator: bool = False
     auth_type: str = "api_key"            # api_key | oauth_device_code | oauth_external | external_process
     extra_env_vars: Tuple[str, ...] = ()  # env vars models.dev doesn't list
@@ -77,6 +77,9 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
     "anthropic": HermesOverlay(
         transport="anthropic_messages",
         extra_env_vars=("ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
+    ),
+    "gemini": HermesOverlay(
+        transport="google_genai",
     ),
     "zai": HermesOverlay(
         transport="openai_chat",
@@ -261,6 +264,7 @@ TRANSPORT_TO_API_MODE: Dict[str, str] = {
     "openai_chat": "chat_completions",
     "anthropic_messages": "anthropic_messages",
     "codex_responses": "codex_responses",
+    "google_genai": "google_genai",
 }
 
 

@@ -587,6 +587,105 @@ class AsyncAnthropicAuxiliaryClient:
         self.base_url = sync_wrapper.base_url
 
 
+# ── Native Gemini auxiliary wrappers ───────────────────────────────────────
+
+class _GeminiCompletionsAdapter:
+    """OpenAI-client-compatible adapter for native Gemini generateContent API."""
+
+    def __init__(self, real_client: Any, model: str):
+        self._client = real_client
+        self._model = model
+
+    def create(self, **kwargs) -> Any:
+        from agent.gemini_adapter import build_gemini_kwargs, normalize_gemini_response
+
+        messages = kwargs.get("messages", [])
+        model = kwargs.get("model", self._model)
+        tools = kwargs.get("tools")
+        max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens") or 2000
+        temperature = kwargs.get("temperature")
+
+        gemini_kwargs = build_gemini_kwargs(
+            model=model,
+            messages=messages,
+            tools=tools,
+            max_tokens=max_tokens,
+            reasoning_config=None,
+            system_prompt="",
+            temperature=temperature,
+            flex_mode=False,  # auxiliary calls don't need flex
+        )
+
+        response = self._client.models.generate_content(**gemini_kwargs)
+        assistant_message, finish_reason = normalize_gemini_response(response)
+
+        # Extract usage if available
+        usage = None
+        usage_meta = getattr(response, "usage_metadata", None)
+        if usage_meta:
+            prompt_tokens = getattr(usage_meta, "prompt_token_count", 0) or 0
+            completion_tokens = getattr(usage_meta, "candidates_token_count", 0) or 0
+            total_tokens = getattr(usage_meta, "total_token_count", 0) or (prompt_tokens + completion_tokens)
+            usage = SimpleNamespace(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+            )
+
+        choice = SimpleNamespace(
+            index=0,
+            message=assistant_message,
+            finish_reason=finish_reason,
+        )
+        return SimpleNamespace(
+            choices=[choice],
+            model=model,
+            usage=usage,
+        )
+
+
+class _GeminiChatShim:
+    def __init__(self, adapter: _GeminiCompletionsAdapter):
+        self.completions = adapter
+
+
+class GeminiAuxiliaryClient:
+    """OpenAI-client-compatible wrapper over a native Gemini client."""
+
+    def __init__(self, real_client: Any, model: str, api_key: str):
+        self._real_client = real_client
+        adapter = _GeminiCompletionsAdapter(real_client, model)
+        self.chat = _GeminiChatShim(adapter)
+        self.api_key = api_key
+        self.base_url = "https://generativelanguage.googleapis.com"
+
+    def close(self):
+        pass  # genai.Client has no close method
+
+
+class _AsyncGeminiCompletionsAdapter:
+    def __init__(self, sync_adapter: _GeminiCompletionsAdapter):
+        self._sync = sync_adapter
+
+    async def create(self, **kwargs) -> Any:
+        import asyncio
+        return await asyncio.to_thread(self._sync.create, **kwargs)
+
+
+class _AsyncGeminiChatShim:
+    def __init__(self, adapter: _AsyncGeminiCompletionsAdapter):
+        self.completions = adapter
+
+
+class AsyncGeminiAuxiliaryClient:
+    def __init__(self, sync_wrapper: "GeminiAuxiliaryClient"):
+        sync_adapter = sync_wrapper.chat.completions
+        async_adapter = _AsyncGeminiCompletionsAdapter(sync_adapter)
+        self.chat = _AsyncGeminiChatShim(async_adapter)
+        self.api_key = sync_wrapper.api_key
+        self.base_url = sync_wrapper.base_url
+
+
 def _read_nous_auth() -> Optional[dict]:
     """Read and validate ~/.hermes/auth.json for an active Nous provider.
 
@@ -704,6 +803,9 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             except ImportError:
                 pass
             return _try_anthropic()
+
+        if provider_id == "gemini":
+            return _try_gemini()
 
         pool_present, entry = _select_pool_entry(provider_id)
         if pool_present:
@@ -1011,6 +1113,39 @@ def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
     return AnthropicAuxiliaryClient(real_client, model, token, base_url, is_oauth=is_oauth), model
 
 
+def _try_gemini() -> Tuple[Optional[Any], Optional[str]]:
+    """Try to create a native Gemini auxiliary client.
+
+    Checks GEMINI_API_KEY / GOOGLE_API_KEY env vars, then falls back to
+    the credential pool for the ``gemini`` provider.
+    """
+    try:
+        from agent.gemini_adapter import build_gemini_client
+    except ImportError:
+        return None, None
+
+    pool_present, entry = _select_pool_entry("gemini")
+    if pool_present:
+        if entry is None:
+            return None, None
+        api_key = _pool_runtime_api_key(entry)
+    else:
+        api_key = (
+            os.getenv("GEMINI_API_KEY", "").strip()
+            or os.getenv("GOOGLE_API_KEY", "").strip()
+        )
+    if not api_key:
+        return None, None
+
+    model = _API_KEY_PROVIDER_AUX_MODELS.get("gemini", "gemini-3-flash-preview")
+    logger.debug("Auxiliary client: Gemini native (%s)", model)
+    try:
+        real_client = build_gemini_client(api_key)
+    except ImportError:
+        return None, None
+    return GeminiAuxiliaryClient(real_client, model, api_key), model
+
+
 _AUTO_PROVIDER_LABELS = {
     "_try_openrouter": "openrouter",
     "_try_nous": "nous",
@@ -1212,6 +1347,8 @@ def _to_async_client(sync_client, model: str):
         return AsyncCodexAuxiliaryClient(sync_client), model
     if isinstance(sync_client, AnthropicAuxiliaryClient):
         return AsyncAnthropicAuxiliaryClient(sync_client), model
+    if isinstance(sync_client, GeminiAuxiliaryClient):
+        return AsyncGeminiAuxiliaryClient(sync_client), model
 
     async_kwargs = {
         "api_key": sync_client.api_key,
@@ -1470,6 +1607,14 @@ def resolve_provider_client(
             final_model = _normalize_resolved_model(model or default_model, provider)
             return (_to_async_client(client, final_model) if async_mode else (client, final_model))
 
+        if provider == "gemini":
+            client, default_model = _try_gemini()
+            if client is None:
+                logger.warning("resolve_provider_client: gemini requested but no Gemini credentials found")
+                return None, None
+            final_model = _normalize_resolved_model(model or default_model, provider)
+            return (_to_async_client(client, final_model) if async_mode else (client, final_model))
+
         creds = resolve_api_key_provider_credentials(provider)
         api_key = str(creds.get("api_key", "")).strip()
         if not api_key:
@@ -1601,6 +1746,8 @@ def _resolve_strict_vision_backend(provider: str) -> Tuple[Optional[Any], Option
         return _try_codex()
     if provider == "anthropic":
         return _try_anthropic()
+    if provider == "gemini":
+        return _try_gemini()
     if provider == "custom":
         return _try_custom_endpoint()
     return None, None

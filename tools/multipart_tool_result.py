@@ -9,14 +9,15 @@ their JSON result:
         "resolution": "high"
     }}
 
-The harness calls ``extract_multipart_content()`` after tool execution but before
-message construction.  For vision-capable providers (Gemini), the image is converted
-to multipart content.  For others, the ``_image`` key is silently stripped so only
-clean text reaches the model.
+The harness calls ``extract_image_from_result()`` after tool execution.  The
+``_image`` key is always stripped from the tool message text.  For vision-capable
+providers, the image is injected as a **separate user message** immediately after
+the tool result — Gemini's OpenAI-compatible endpoint does not support images in
+tool-role messages, but does support them in user-role messages.
 
 The ``resolution`` field is advisory — it maps to Gemini's ``media_resolution``
-levels (low=280 tokens, medium=560, high=1120).  Currently passed through as-is;
-a future native Gemini API path could use it for per-image resolution control.
+levels (low=280 tokens, medium=560, high=1120).  A future native Gemini API path
+could use it for per-image resolution control.
 """
 
 import json
@@ -24,67 +25,62 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Providers that support vision via multipart content in tool results.
+# Providers that support vision via user-message image injection.
 _VISION_PROVIDERS = {"gemini", "google"}
 
 # Approximate token costs for image parts (Gemini high resolution).
 IMAGE_TOKEN_ESTIMATE = 1120
 
 
-def extract_multipart_content(function_result: str, provider: str = None):
-    """Parse tool result JSON, extract ``_image`` if present, return content.
+def extract_image_from_result(function_result: str, provider: str = None):
+    """Parse tool result JSON, extract ``_image`` if present.
 
-    For vision providers (Gemini):
-        Returns a list with text + image_url parts (OpenAI-compatible format).
-
-    For other providers or when no image is present:
-        Returns a plain string (``_image`` stripped to save context).
+    Always strips ``_image`` from the text content (so no base64 bloats the
+    tool message).  For vision providers, returns the raw image data dict
+    so the caller can attach it to the tool message for native handling.
 
     Args:
         function_result: Raw tool result string (expected to be JSON).
         provider: Provider name (e.g. "gemini", "anthropic", "openai").
 
     Returns:
-        str or list: Content suitable for the ``tool`` message's ``content`` field.
+        tuple: (cleaned_text: str, image_data: dict | None)
+            - cleaned_text: tool result with _image stripped
+            - image_data: raw image dict with media_type/base64 keys, or None
     """
     if not function_result or not isinstance(function_result, str):
-        return function_result
+        return function_result, None
 
     try:
         parsed = json.loads(function_result)
     except (json.JSONDecodeError, TypeError):
-        return function_result
+        return function_result, None
 
     if not isinstance(parsed, dict) or "_image" not in parsed:
-        return function_result
+        return function_result, None
 
     # Pop the image data — always strip it from the text portion.
     image_data = parsed.pop("_image")
     text_content = json.dumps(parsed, ensure_ascii=False)
 
-    # Non-vision providers get text only.
+    # Non-vision providers get text only, no image data.
     if provider not in _VISION_PROVIDERS:
-        return text_content
+        return text_content, None
 
     # Validate image payload.
     media_type = image_data.get("media_type", "image/png")
     b64 = image_data.get("base64", "")
     if not b64:
         logger.warning("_image key present but base64 data is empty")
-        return text_content
+        return text_content, None
 
     logger.debug(
-        "Multipart tool result: %s, ~%d KB image",
+        "Extracted image from tool result: %s, ~%d KB",
         media_type, len(b64) * 3 // 4 // 1024,
     )
 
-    return [
-        {"type": "text", "text": text_content},
-        {
-            "type": "image_url",
-            "image_url": {"url": f"data:{media_type};base64,{b64}"},
-        },
-    ]
+    # Return the raw image data — the adapter handles native injection.
+    return text_content, {"media_type": media_type, "base64": b64}
 
 
 def strip_images_from_content(content):
