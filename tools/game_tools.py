@@ -382,15 +382,24 @@ def _gemini_call(model, prompt, image_b64, system=None, response_schema=None):
             {"text": prompt},
         ],
     }]
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             response = client.models.generate_content(
                 model=model, contents=contents, config=config,
             )
             return response.text
         except Exception as e:
-            if attempt == 0:
-                logger.warning("Gemini call failed (%s), retrying: %s", model, e)
+            err_str = str(e)
+            is_rate_limit = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str
+            if is_rate_limit and model == PRO_MODEL and attempt == 0:
+                # Fall back to Flash on Pro rate limit
+                logger.warning("Pro rate-limited, falling back to Flash: %s",
+                               err_str[:100])
+                model = FLASH_MODEL
+                _time.sleep(1)
+            elif attempt < 2:
+                logger.warning("Gemini call failed (%s), retrying: %s",
+                               model, e)
                 _time.sleep(2)
             else:
                 raise
@@ -433,9 +442,13 @@ def _should_escalate(game_state_text, turn_number, force_review,
 
 
 _LOCATE_SYSTEM_PROMPT = (
-    "You identify UI elements in screenshots and return bounding box "
-    "coordinates on a NORMALIZED 0-1000 scale. Respond with ONLY a JSON "
-    "object: {\"y0\": N, \"x0\": N, \"y1\": N, \"x1\": N, \"confidence\": "
+    "You identify UI elements in screenshots and return TIGHT bounding box "
+    "coordinates on a NORMALIZED 0-1000 scale. The bounding box must "
+    "enclose the ENTIRE element (full width and height of the button, "
+    "icon, or text label) so that the center of the box is the center "
+    "of the element. Do not return a partial bounding box.\n"
+    "Respond with ONLY a JSON object: "
+    "{\"y0\": N, \"x0\": N, \"y1\": N, \"x1\": N, \"confidence\": "
     "F, \"description\": \"...\"}\n"
     "If target not visible: {\"y0\": null, \"x0\": null, \"y1\": null, "
     "\"x1\": null, \"confidence\": 0, \"description\": \"...\"}"
@@ -477,6 +490,8 @@ def _precision_click(target, full_w, full_h, focus_fn):
     x0, y0 = coords["x0"], coords["y0"]
     x1, y1 = coords["x1"], coords["y1"]
     box_area = (x1 - x0) * (y1 - y0) / 1_000_000  # fraction of screen
+    logger.debug("precision_click pass1: target=%r box=[%d,%d→%d,%d] area=%.3f",
+                 target, x0, y0, x1, y1, box_area)
 
     # ── PASS 2: zoom if target is small ──
     if box_area < _ZOOM_THRESHOLD:
@@ -500,6 +515,10 @@ def _precision_click(target, full_w, full_h, focus_fn):
 
             if (zoom_coords.get("x0") is not None
                     and zoom_coords.get("confidence", 0) >= 0.5):
+                logger.debug("precision_click pass2: box=[%d,%d→%d,%d] conf=%.2f",
+                             zoom_coords["x0"], zoom_coords["y0"],
+                             zoom_coords["x1"], zoom_coords["y1"],
+                             zoom_coords.get("confidence", 0))
                 # Remap from crop-space (0-1000) to full-screen pixels
                 crop_w = crop_off["px_x1"] - crop_off["px_x0"]
                 crop_h = crop_off["px_y1"] - crop_off["px_y0"]
