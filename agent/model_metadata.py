@@ -1058,8 +1058,16 @@ def estimate_tokens_rough(text: str) -> int:
 
 def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     """Rough token estimate for a message list (pre-flight only)."""
-    total_chars = sum(len(str(msg)) for msg in messages)
-    return (total_chars + 3) // 4
+    from tools.multipart_tool_result import estimate_content_tokens
+    total = 0
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list):
+            # Multipart content — use image-aware estimation
+            total += estimate_content_tokens(content)
+        else:
+            total += (len(str(msg)) + 3) // 4
+    return total
 
 
 def estimate_request_tokens_rough(
@@ -1075,11 +1083,11 @@ def estimate_request_tokens_rough(
     tools enabled, schemas alone can add 20-30K tokens — a significant
     blind spot when only counting messages.
     """
-    total_chars = 0
+    total = 0
     if system_prompt:
-        total_chars += len(system_prompt)
+        total += (len(system_prompt) + 3) // 4
     if messages:
-        total_chars += sum(len(str(msg)) for msg in messages)
+        total += estimate_messages_tokens_rough(messages)
     if tools:
-        total_chars += len(str(tools))
-    return (total_chars + 3) // 4
+        total += (len(str(tools)) + 3) // 4
+    return total

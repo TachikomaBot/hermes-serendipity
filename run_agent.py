@@ -2227,6 +2227,10 @@ class AIAgent:
             for msg in messages[flush_from:]:
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
+                # Strip image parts before DB storage to avoid bloat
+                if isinstance(content, list):
+                    from tools.multipart_tool_result import strip_images_from_content
+                    content = strip_images_from_content(content)
                 tool_calls_data = None
                 if hasattr(msg, "tool_calls") and msg.tool_calls:
                     tool_calls_data = [
@@ -2756,6 +2760,11 @@ class AIAgent:
                 if msg.get("role") == "assistant" and msg.get("content"):
                     msg = dict(msg)
                     msg["content"] = self._clean_session_content(msg["content"])
+                # Strip image parts from tool results to avoid log bloat
+                if isinstance(msg.get("content"), list):
+                    from tools.multipart_tool_result import strip_images_from_content
+                    msg = dict(msg)
+                    msg["content"] = strip_images_from_content(msg["content"])
                 cleaned.append(msg)
 
             # Guard: never overwrite a larger session log with fewer messages.
@@ -6958,6 +6967,10 @@ class AIAgent:
             if subdir_hints:
                 function_result += subdir_hints
 
+            # ── Convert to multipart if image present ──
+            from tools.multipart_tool_result import extract_multipart_content
+            function_result = extract_multipart_content(function_result, provider=self.provider)
+
             tool_msg = {
                 "role": "tool",
                 "content": function_result,
@@ -7281,6 +7294,10 @@ class AIAgent:
             if subdir_hints:
                 function_result += subdir_hints
 
+            # ── Convert to multipart if image present ──
+            from tools.multipart_tool_result import extract_multipart_content
+            function_result = extract_multipart_content(function_result, provider=self.provider)
+
             tool_msg = {
                 "role": "tool",
                 "content": function_result,
@@ -7289,11 +7306,12 @@ class AIAgent:
             messages.append(tool_msg)
 
             if not self.quiet_mode:
+                _log_result = str(function_result) if isinstance(function_result, list) else function_result
                 if self.verbose_logging:
                     print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
-                    print(f"     Result: {function_result}")
+                    print(f"     Result: {_log_result[:500]}")
                 else:
-                    response_preview = function_result[:self.log_prefix_chars] + "..." if len(function_result) > self.log_prefix_chars else function_result
+                    response_preview = _log_result[:self.log_prefix_chars] + "..." if len(_log_result) > self.log_prefix_chars else _log_result
                     print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
 
             if self._interrupt_requested and i < len(assistant_message.tool_calls):

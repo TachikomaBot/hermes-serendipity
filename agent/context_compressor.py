@@ -207,7 +207,12 @@ class ContextCompressor(ContextEngine):
             min_protect = min(protect_tail_count, len(result) - 1)
             for i in range(len(result) - 1, -1, -1):
                 msg = result[i]
-                content_len = len(msg.get("content") or "")
+                _content = msg.get("content") or ""
+                if isinstance(_content, list):
+                    from tools.multipart_tool_result import estimate_content_tokens
+                    content_len = estimate_content_tokens(_content) * _CHARS_PER_TOKEN
+                else:
+                    content_len = len(_content)
                 msg_tokens = content_len // _CHARS_PER_TOKEN + 10
                 for tc in msg.get("tool_calls") or []:
                     if isinstance(tc, dict):
@@ -228,6 +233,11 @@ class ContextCompressor(ContextEngine):
                 continue
             content = msg.get("content", "")
             if not content or content == _PRUNED_TOOL_PLACEHOLDER:
+                continue
+            # Multipart content (list with image parts) — always prune
+            if isinstance(content, list):
+                result[i] = {**msg, "content": _PRUNED_TOOL_PLACEHOLDER}
+                pruned += 1
                 continue
             # Only prune if the content is substantial (>200 chars)
             if len(content) > 200:
@@ -271,6 +281,10 @@ class ContextCompressor(ContextEngine):
         for msg in turns:
             role = msg.get("role", "unknown")
             content = msg.get("content") or ""
+            # Multipart content (list with image parts) → text-only for summarizer
+            if isinstance(content, list):
+                from tools.multipart_tool_result import strip_images_from_content
+                content = strip_images_from_content(content)
 
             # Tool results: keep enough content for the summarizer
             if role == "tool":
@@ -621,7 +635,11 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         for i in range(n - 1, head_end - 1, -1):
             msg = messages[i]
             content = msg.get("content") or ""
-            msg_tokens = len(content) // _CHARS_PER_TOKEN + 10  # +10 for role/metadata
+            if isinstance(content, list):
+                from tools.multipart_tool_result import estimate_content_tokens
+                msg_tokens = estimate_content_tokens(content) + 10
+            else:
+                msg_tokens = len(content) // _CHARS_PER_TOKEN + 10  # +10 for role/metadata
             # Include tool call arguments in estimate
             for tc in msg.get("tool_calls") or []:
                 if isinstance(tc, dict):

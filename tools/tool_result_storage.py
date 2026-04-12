@@ -143,6 +143,10 @@ def maybe_persist_tool_result(
     if effective_threshold == float("inf"):
         return content
 
+    # Skip persistence for non-string content (e.g. multipart with images)
+    if not isinstance(content, str):
+        return content
+
     if len(content) <= effective_threshold:
         return content
 
@@ -189,6 +193,9 @@ def enforce_turn_budget(
     total_size = 0
     for i, msg in enumerate(tool_messages):
         content = msg.get("content", "")
+        # Skip multipart content (list with image parts) — not budget-managed
+        if not isinstance(content, str):
+            continue
         size = len(content)
         total_size += size
         if PERSISTED_OUTPUT_TAG not in content:

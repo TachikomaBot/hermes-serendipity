@@ -1560,11 +1560,12 @@ def menu_navigate(args: dict, **kwargs) -> str:
 
 
 def game_screenshot(args: dict, **kwargs) -> str:
-    """Capture a screenshot of the game and return a description of the game state.
+    """Capture a screenshot and return it with a brief text summary.
 
-    Sends the full-resolution screenshot to Gemini Pro for analysis and returns
-    a detailed text description of what's visible on screen. Optionally zooms
-    into a region for closer inspection.
+    The raw screenshot is included as ``_image`` in the result JSON so the
+    main model can see it directly (via multipart tool results).  A brief
+    Flash-generated summary is included for logging and as a fallback for
+    non-vision providers.  Optionally zooms into a region.
     """
     try:
         context = args.get("context", "")
@@ -1576,27 +1577,30 @@ def game_screenshot(args: dict, **kwargs) -> str:
         else:
             img_b64, w, h = _capture_and_downscale()
 
-        prompt = (
-            "Analyze this screenshot. Describe what you see:\n"
-            "- What screen, window, or view is this?\n"
-            "- What UI elements are visible (buttons, menus, tabs, panels)?\n"
-            "- What text, labels, numbers, or status info can you read?\n"
-            "- Are there any notifications, highlights, or elements that "
-            "seem to want attention?\n"
-            "Be specific and thorough. Read all visible text."
+        # Brief Flash summary for logging + fallback for non-vision providers
+        summary_prompt = (
+            "2-3 sentence summary of this screenshot. "
+            "Key status info only — screen type, important UI elements, "
+            "any notifications or alerts."
         )
         if context:
-            prompt += f"\n\nContext: {context}"
+            summary_prompt += f" Focus on: {context}"
+        brief = _gemini_call(FLASH_MODEL, summary_prompt, img_b64)
 
-        analysis = _gemini_call(PRO_MODEL, prompt, img_b64)
         _region_str = f" region={region}" if region else ""
-        logger.info("game_screenshot: context=%r%s | %dx%d | analysis=%s",
+        logger.info("game_screenshot: context=%r%s | %dx%d | %s",
                      context or "(none)", _region_str, w, h,
-                     analysis[:200].replace("\n", " "))
+                     brief[:150].replace("\n", " "))
+
         return json.dumps({
             "status": "ok",
             "resolution": f"{w}x{h}",
-            "analysis": analysis,
+            "analysis": brief,
+            "_image": {
+                "media_type": "image/png",
+                "base64": img_b64,
+                "resolution": "high",
+            },
         })
     except Exception as e:
         logger.warning("game_screenshot error: %s", e)
