@@ -42,7 +42,7 @@ import atexit
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,9 @@ from tools.tool_backend_helpers import (
     resolve_modal_backend_state,
 )
 
+
+# Hard cap on foreground timeout; override via TERMINAL_MAX_FOREGROUND_TIMEOUT env var.
+FOREGROUND_MAX_TIMEOUT = int(os.getenv("TERMINAL_MAX_FOREGROUND_TIMEOUT", "600"))
 
 # Disk usage warning threshold (in GB)
 DISK_USAGE_WARNING_THRESHOLD_GB = float(os.getenv("TERMINAL_DISK_WARNING_GB", "500"))
@@ -1134,9 +1137,9 @@ def terminal_tool(
     task_id: Optional[str] = None,
     force: bool = False,
     workdir: Optional[str] = None,
-    check_interval: Optional[int] = None,
     pty: bool = False,
     notify_on_complete: bool = False,
+    watch_patterns: Optional[List[str]] = None,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -1148,9 +1151,9 @@ def terminal_tool(
         task_id: Unique identifier for environment isolation (optional)
         force: If True, skip dangerous command check (use after user confirms)
         workdir: Working directory for this command (optional, uses session cwd if not set)
-        check_interval: Seconds between auto-checks for background processes (gateway only, min 30)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
         notify_on_complete: If True and background=True, auto-notify the agent when the process exits
+        watch_patterns: List of strings to watch for in background output; triggers notification on match
 
     Returns:
         str: JSON string with output, exit_code, and error fields
@@ -1207,6 +1210,17 @@ def terminal_tool(
         cwd = overrides.get("cwd") or config["cwd"]
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
+
+        # Reject foreground commands where the model explicitly requests
+        # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
+        if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:
+            return json.dumps({
+                "error": (
+                    f"Foreground timeout {timeout}s exceeds the maximum of "
+                    f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true with "
+                    f"notify_on_complete=true for long-running commands."
+                ),
+            }, ensure_ascii=False)
 
         # Start cleanup thread
         _start_cleanup_thread()
@@ -1398,14 +1412,6 @@ def terminal_tool(
                 if pty_disabled_reason:
                     result_data["pty_note"] = pty_disabled_reason
 
-                # Transparent timeout clamping note
-                max_timeout = effective_timeout
-                if timeout and timeout > max_timeout:
-                    result_data["timeout_note"] = (
-                        f"Requested timeout {timeout}s was clamped to "
-                        f"configured limit of {max_timeout}s"
-                    )
-
                 # Mark for agent notification on completion
                 if notify_on_complete and background:
                     proc_session.notify_on_complete = True
@@ -1414,12 +1420,17 @@ def terminal_tool(
                     # In gateway mode, auto-register a fast watcher so the
                     # gateway can detect completion and trigger a new agent
                     # turn.  CLI mode uses the completion_queue directly.
-                    _gw_platform = os.getenv("HERMES_SESSION_PLATFORM", "")
-                    if _gw_platform and not check_interval:
-                        _gw_chat_id = os.getenv("HERMES_SESSION_CHAT_ID", "")
-                        _gw_thread_id = os.getenv("HERMES_SESSION_THREAD_ID", "")
+                    from gateway.session_context import get_session_env as _gse
+                    _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
+                    if _gw_platform:
+                        _gw_chat_id = _gse("HERMES_SESSION_CHAT_ID", "")
+                        _gw_thread_id = _gse("HERMES_SESSION_THREAD_ID", "")
+                        _gw_user_id = _gse("HERMES_SESSION_USER_ID", "")
+                        _gw_user_name = _gse("HERMES_SESSION_USER_NAME", "")
                         proc_session.watcher_platform = _gw_platform
                         proc_session.watcher_chat_id = _gw_chat_id
+                        proc_session.watcher_user_id = _gw_user_id
+                        proc_session.watcher_user_name = _gw_user_name
                         proc_session.watcher_thread_id = _gw_thread_id
                         proc_session.watcher_interval = 5
                         process_registry.pending_watchers.append({
@@ -1428,35 +1439,16 @@ def terminal_tool(
                             "session_key": session_key,
                             "platform": _gw_platform,
                             "chat_id": _gw_chat_id,
+                            "user_id": _gw_user_id,
+                            "user_name": _gw_user_name,
                             "thread_id": _gw_thread_id,
                             "notify_on_complete": True,
                         })
 
-                # Register check_interval watcher (gateway picks this up after agent run)
-                if check_interval and background:
-                    effective_interval = max(30, check_interval)
-                    if check_interval < 30:
-                        result_data["check_interval_note"] = (
-                            f"Requested {check_interval}s raised to minimum 30s"
-                        )
-                    watcher_platform = os.getenv("HERMES_SESSION_PLATFORM", "")
-                    watcher_chat_id = os.getenv("HERMES_SESSION_CHAT_ID", "")
-                    watcher_thread_id = os.getenv("HERMES_SESSION_THREAD_ID", "")
-
-                    # Store on session for checkpoint persistence
-                    proc_session.watcher_platform = watcher_platform
-                    proc_session.watcher_chat_id = watcher_chat_id
-                    proc_session.watcher_thread_id = watcher_thread_id
-                    proc_session.watcher_interval = effective_interval
-
-                    process_registry.pending_watchers.append({
-                        "session_id": proc_session.id,
-                        "check_interval": effective_interval,
-                        "session_key": session_key,
-                        "platform": watcher_platform,
-                        "chat_id": watcher_chat_id,
-                        "thread_id": watcher_thread_id,
-                    })
+                # Set watch patterns for output monitoring
+                if watch_patterns and background:
+                    proc_session.watch_patterns = list(watch_patterns)
+                    result_data["watch_patterns"] = proc_session.watch_patterns
 
                 return json.dumps(result_data, ensure_ascii=False)
             except Exception as e:
@@ -1733,17 +1725,12 @@ TERMINAL_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds to wait (default: 180). Returns INSTANTLY when command finishes — set high for long tasks, you won't wait unnecessarily.",
+                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). Returns INSTANTLY when command finishes — set high for long tasks, you won't wait unnecessarily. Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; use background=true for longer commands.",
                 "minimum": 1
             },
             "workdir": {
                 "type": "string",
                 "description": "Working directory for this command (absolute path). Defaults to the session working directory."
-            },
-            "check_interval": {
-                "type": "integer",
-                "description": "Seconds between automatic status checks for background processes (gateway/messaging only, minimum 30). When set, I'll proactively report progress.",
-                "minimum": 30
             },
             "pty": {
                 "type": "boolean",
@@ -1754,6 +1741,11 @@ TERMINAL_SCHEMA = {
                 "type": "boolean",
                 "description": "When true (and background=true), you'll be automatically notified when the process finishes — no polling needed. Use this for tasks that take a while (tests, builds, deployments) so you can keep working on other things in the meantime.",
                 "default": False
+            },
+            "watch_patterns": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of strings to watch for in background process output. When any pattern matches a line of output, you'll be notified with the matching text — like notify_on_complete but triggers mid-process on specific output. Use for monitoring logs, watching for errors, or waiting for specific events (e.g. [\"ERROR\", \"FAIL\", \"listening on port\"])."
             }
         },
         "required": ["command"]
@@ -1768,9 +1760,9 @@ def _handle_terminal(args, **kw):
         timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
         workdir=args.get("workdir"),
-        check_interval=args.get("check_interval"),
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),
+        watch_patterns=args.get("watch_patterns"),
     )
 
 
