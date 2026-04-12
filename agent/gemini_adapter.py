@@ -212,9 +212,12 @@ def convert_messages_to_gemini(
                     args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
                 except (json.JSONDecodeError, ValueError):
                     args = {}
-                parts.append(types.Part.from_function_call(
-                    name=name, id=tc_id, args=args,
-                ))
+                # Build FunctionCall with id, then wrap in Part.
+                # Part.from_function_call() doesn't accept id, but
+                # FunctionCall() does — and we need to preserve it
+                # for tool_call_id matching on round-trip.
+                fc = types.FunctionCall(name=name, id=tc_id, args=args)
+                parts.append(types.Part(function_call=fc))
 
             # Gemini rejects empty model content
             if not parts:
@@ -238,7 +241,7 @@ def convert_messages_to_gemini(
                 result_obj = {"result": result_text}
 
             parts = [types.Part.from_function_response(
-                name=tool_name, id=tc_id, response=result_obj,
+                name=tool_name, response=result_obj,
             )]
 
             # Handle image data attached to tool result

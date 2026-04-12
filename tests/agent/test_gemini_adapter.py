@@ -17,22 +17,23 @@ class _MockTypes:
     """Minimal mock of google.genai.types for testing."""
 
     class Part:
-        def __init__(self, text=None, thought=False):
+        def __init__(self, text=None, thought=False, function_call=None, function_response=None):
             self.text = text
             self.thought = thought
-            self.function_call = None
-            self.function_response = None
+            self.function_call = function_call
+            self.function_response = function_response
 
         @staticmethod
         def from_function_call(name="", id="", args=None):
+            """Test helper — simulates API response Parts with function_call."""
             p = _MockTypes.Part()
             p.function_call = SimpleNamespace(name=name, id=id, args=args or {})
             return p
 
         @staticmethod
-        def from_function_response(name="", id="", response=None):
+        def from_function_response(name="", response=None):
             p = _MockTypes.Part()
-            p.function_response = SimpleNamespace(name=name, id=id, response=response or {})
+            p.function_response = SimpleNamespace(name=name, response=response or {})
             return p
 
         @staticmethod
@@ -45,6 +46,12 @@ class _MockTypes:
         def __init__(self, role="", parts=None):
             self.role = role
             self.parts = parts or []
+
+    class FunctionCall:
+        def __init__(self, name="", id="", args=None, **kwargs):
+            self.name = name
+            self.id = id
+            self.args = args or {}
 
     class FunctionDeclaration:
         def __init__(self, name="", description="", parameters=None):
