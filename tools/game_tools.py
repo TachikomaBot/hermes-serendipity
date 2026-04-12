@@ -127,8 +127,8 @@ DISPLAY = os.environ.get("DISPLAY", ":99")
 # ---------------------------------------------------------------------------
 # game_turn constants
 # ---------------------------------------------------------------------------
-FLASH_MODEL = "gemini-2.5-flash"
-PRO_MODEL = "gemini-3.1-pro-preview"
+FLASH_MODEL = "gemini-3-flash-preview"
+PRO_MODEL = "gemini-3-flash-preview"
 DEFAULT_DOWNSCALE = (960, 540)
 MAX_OBSERVATIONS = 6          # screenshot-analyze cycles per game_turn call
 MAX_ACTIONS_HARD_CAP = 30     # total actions (clicks+keys) per call
