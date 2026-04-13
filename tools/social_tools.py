@@ -10,6 +10,7 @@ changes.
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("tools.social_tools")
@@ -93,6 +94,58 @@ def _enrich_post(post_view) -> Dict[str, Any]:
     return result
 
 
+def _build_facets(text: str, client) -> List:
+    """Detect @mentions and URLs in text and return Bluesky facets.
+
+    Facets use *byte* offsets into the UTF-8 encoded text, not character
+    offsets — this matches what the Bluesky app itself produces.
+    """
+    from atproto import models
+
+    facets = []
+    text_bytes = text.encode("utf-8")
+
+    # --- @mentions (e.g. @alice.bsky.social) ---
+    for m in re.finditer(r"(?<!\w)@([\w.-]+\.[\w.-]+)", text):
+        handle = m.group(1)
+        # Resolve handle → DID
+        try:
+            profile = client.app.bsky.actor.get_profile({"actor": handle})
+            did = profile.did
+        except Exception:
+            continue  # skip unresolvable handles
+
+        # Byte offsets for the full @handle span
+        start = len(text[: m.start()].encode("utf-8"))
+        end = len(text[: m.end()].encode("utf-8"))
+
+        facets.append(
+            models.AppBskyRichtextFacet.Main(
+                index=models.AppBskyRichtextFacet.ByteSlice(
+                    byte_start=start, byte_end=end,
+                ),
+                features=[models.AppBskyRichtextFacet.Mention(did=did)],
+            )
+        )
+
+    # --- URLs (https://... or http://...) ---
+    for m in re.finditer(r"https?://[^\s<>\)\]]+", text):
+        url = m.group(0)
+        start = len(text[: m.start()].encode("utf-8"))
+        end = len(text[: m.end()].encode("utf-8"))
+
+        facets.append(
+            models.AppBskyRichtextFacet.Main(
+                index=models.AppBskyRichtextFacet.ByteSlice(
+                    byte_start=start, byte_end=end,
+                ),
+                features=[models.AppBskyRichtextFacet.Link(uri=url)],
+            )
+        )
+
+    return facets if facets else None
+
+
 class _BlueskyBackend:
     """Lazy-initialised Bluesky / AT Protocol backend."""
 
@@ -137,7 +190,7 @@ class _BlueskyBackend:
 
     # -- posting -------------------------------------------------------------
 
-    def post(self, text: str, image_path: Optional[str] = None) -> Dict:
+    def post(self, text: str, image_path: Optional[str] = None, image_alt: Optional[str] = None) -> Dict:
         client = self._ensure_client()
         truncated = False
         if len(text) > 300:
@@ -150,16 +203,19 @@ class _BlueskyBackend:
                 img_data = f.read()
             blob = client.upload_blob(img_data)
             from atproto import models
+            # Use provided alt text, or auto-generate from the post text
+            alt_text = image_alt or (text[:1000] if text else "Image")
             embed = models.AppBskyEmbedImages.Main(
                 images=[
                     models.AppBskyEmbedImages.Image(
-                        alt="",
+                        alt=alt_text,
                         image=blob.blob,
                     )
                 ]
             )
 
-        response = client.send_post(text=text, embed=embed)
+        facets = _build_facets(text, client)
+        response = client.send_post(text=text, embed=embed, facets=facets)
         logger.info("social_post: posted '%s'", text[:80])
         result = {"status": "posted", "uri": response.uri, "cid": response.cid}
         if truncated:
@@ -198,12 +254,14 @@ class _BlueskyBackend:
         parent_ref = StrongRef(uri=parent_uri, cid=parent_cid)
         root_ref = StrongRef(uri=root_uri, cid=root_cid)
 
+        facets = _build_facets(text, client)
         response = client.send_post(
             text=text,
             reply_to=models.AppBskyFeedPost.ReplyRef(
                 parent=parent_ref,
                 root=root_ref,
             ),
+            facets=facets,
         )
         logger.info("social_reply: replied to %s", parent_uri)
         result = {"status": "replied", "uri": response.uri, "cid": response.cid}
@@ -222,7 +280,8 @@ class _BlueskyBackend:
         from atproto_client.models.app.bsky.embed.record import Main as EmbedRecord
 
         embed = EmbedRecord(record=StrongRef(uri=quoted_uri, cid=quoted_cid))
-        response = client.send_post(text=text, embed=embed)
+        facets = _build_facets(text, client)
+        response = client.send_post(text=text, embed=embed, facets=facets)
         logger.info("social_quote: quoted %s", quoted_uri)
         result = {"status": "quoted", "uri": response.uri, "cid": response.cid}
         if truncated:
@@ -406,6 +465,7 @@ def social_post(args: dict, **kw) -> str:
         result = _backend.post(
             text=args.get("text", ""),
             image_path=args.get("image_path"),
+            image_alt=args.get("image_alt"),
         )
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
@@ -561,6 +621,10 @@ SOCIAL_POST_SCHEMA = {
             "image_path": {
                 "type": "string",
                 "description": "Optional absolute path to an image file to attach.",
+            },
+            "image_alt": {
+                "type": "string",
+                "description": "Alt text for the image (for accessibility). Auto-generated from post text if omitted.",
             },
         },
         "required": ["text"],
