@@ -192,10 +192,10 @@ class _BlueskyBackend:
 
     def post(self, text: str, image_path: Optional[str] = None, image_alt: Optional[str] = None) -> Dict:
         client = self._ensure_client()
-        truncated = False
         if len(text) > 300:
-            text = text[:297] + "..."
-            truncated = True
+            return {
+                "error": f"Post is {len(text)} characters but the limit is 300. Shorten your text and try again.",
+            }
 
         embed = None
         if image_path and os.path.isfile(image_path):
@@ -217,17 +217,14 @@ class _BlueskyBackend:
         facets = _build_facets(text, client)
         response = client.send_post(text=text, embed=embed, facets=facets)
         logger.info("social_post: posted '%s'", text[:80])
-        result = {"status": "posted", "uri": response.uri, "cid": response.cid}
-        if truncated:
-            result["warning"] = "Text exceeded 300 chars and was truncated. Write shorter posts or split into a thread using social_reply to yourself."
-        return result
+        return {"status": "posted", "uri": response.uri, "cid": response.cid}
 
     def reply(self, text: str, parent_uri: str, parent_cid: str) -> Dict:
         client = self._ensure_client()
-        truncated = False
         if len(text) > 300:
-            text = text[:297] + "..."
-            truncated = True
+            return {
+                "error": f"Reply is {len(text)} characters but the limit is 300. Shorten your text and try again.",
+            }
 
         from atproto import models
         from atproto_client.models.com.atproto.repo.strong_ref import Main as StrongRef
@@ -264,17 +261,14 @@ class _BlueskyBackend:
             facets=facets,
         )
         logger.info("social_reply: replied to %s", parent_uri)
-        result = {"status": "replied", "uri": response.uri, "cid": response.cid}
-        if truncated:
-            result["warning"] = "Text exceeded 300 chars and was truncated."
-        return result
+        return {"status": "replied", "uri": response.uri, "cid": response.cid}
 
     def quote_post(self, text: str, quoted_uri: str, quoted_cid: str) -> Dict:
         client = self._ensure_client()
-        truncated = False
         if len(text) > 300:
-            text = text[:297] + "..."
-            truncated = True
+            return {
+                "error": f"Quote post is {len(text)} characters but the limit is 300. Shorten your text and try again.",
+            }
 
         from atproto_client.models.com.atproto.repo.strong_ref import Main as StrongRef
         from atproto_client.models.app.bsky.embed.record import Main as EmbedRecord
@@ -283,10 +277,7 @@ class _BlueskyBackend:
         facets = _build_facets(text, client)
         response = client.send_post(text=text, embed=embed, facets=facets)
         logger.info("social_quote: quoted %s", quoted_uri)
-        result = {"status": "quoted", "uri": response.uri, "cid": response.cid}
-        if truncated:
-            result["warning"] = "Text exceeded 300 chars and was truncated."
-        return result
+        return {"status": "quoted", "uri": response.uri, "cid": response.cid}
 
     # -- reading -------------------------------------------------------------
 
@@ -604,7 +595,7 @@ SOCIAL_POST_SCHEMA = {
     "name": "social_post",
     "description": (
         "Create a new post on social media. Bluesky posts are limited to "
-        "300 characters; longer text is automatically truncated."
+        "300 characters; posts exceeding this limit will be rejected."
     ),
     "parameters": {
         "type": "object",
