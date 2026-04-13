@@ -35,6 +35,7 @@ _DEFAULT_STATE = {
     "slept_at": None,
     "cycle_count": 0,
     "current_activity": None,
+    "daily_thread_id": None,
 }
 
 

@@ -3294,10 +3294,14 @@ class GatewayRunner:
                     config_context_length=_hyg_config_context_length,
                     provider=_hyg_provider or "",
                 )
+                # Bump hygiene threshold for large-context models so it stays
+                # above the agent's auto-raised 90% compression threshold.
+                if _hyg_context_length >= 500_000:
+                    _hyg_threshold_pct = 0.95
                 _compress_token_threshold = int(
                     _hyg_context_length * _hyg_threshold_pct
                 )
-                _warn_token_threshold = int(_hyg_context_length * 0.95)
+                _warn_token_threshold = int(_hyg_context_length * 0.98)
 
                 _msg_count = len(history)
 

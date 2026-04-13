@@ -1319,6 +1319,26 @@ class AIAgent:
             )
         self.compression_enabled = compression_enabled
 
+        # For large-context models (>=500K), raise compression threshold to 90%
+        # since identity reinjection handles persona drift across long contexts.
+        # Only adjust the default (0.50), not explicit user overrides.
+        if (compression_threshold == 0.50
+                and hasattr(self.context_compressor, 'context_length')
+                and self.context_compressor.context_length >= 500_000):
+            from agent.model_metadata import MINIMUM_CONTEXT_LENGTH as _MIN_CTX
+            self.context_compressor.threshold_percent = 0.90
+            self.context_compressor.threshold_tokens = max(
+                int(self.context_compressor.context_length * 0.90),
+                _MIN_CTX,
+            )
+            if not self.quiet_mode:
+                logger.info(
+                    "Large context model (%s tokens) — raised compression "
+                    "threshold to 90%% (%s tokens)",
+                    f"{self.context_compressor.context_length:,}",
+                    f"{self.context_compressor.threshold_tokens:,}",
+                )
+
         # Reject models whose context window is below the minimum required
         # for reliable tool-calling workflows (64K tokens).
         from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
@@ -3214,6 +3234,64 @@ class AIAgent:
         return getattr(tc, "id", "") or ""
 
     _VALID_API_ROLES = frozenset({"system", "user", "assistant", "tool", "function", "developer"})
+
+    def _inject_identity_reminders(self, api_messages: list) -> list:
+        """Inject condensed SOUL.md reminders at regular token intervals.
+
+        Only activates for large-context models (>=500K tokens).  Inserts
+        synthetic user/assistant message pairs at every ~25% of the context
+        window to reinforce persona identity that would otherwise lose
+        model attention in very long conversations.
+
+        These are API-call-time only — they modify the ``api_messages`` copy,
+        never the persisted conversation history.
+        """
+        ctx_len = getattr(self.context_compressor, "context_length", 0)
+        if ctx_len < 500_000:
+            return api_messages
+
+        from agent.prompt_builder import load_soul_md_condensed
+        condensed = load_soul_md_condensed()
+        if not condensed:
+            return api_messages
+
+        interval_tokens = ctx_len // 4  # 25% intervals
+        result: list = []
+        accumulated_tokens = 0
+        next_threshold = interval_tokens
+        injected_count = 0
+        max_injections = 3  # At 25%, 50%, 75%
+
+        for msg in api_messages:
+            result.append(msg)
+
+            # Rough token estimate from content length
+            content = msg.get("content", "")
+            msg_tokens = (len(content) // 4 + 10) if isinstance(content, str) else 100
+            accumulated_tokens += msg_tokens
+
+            # Never inject between tool_call/tool_result pairs or after system
+            role = msg.get("role", "")
+            if role == "system":
+                continue
+            if role == "assistant" and msg.get("tool_calls"):
+                continue
+            if role in ("tool", "function"):
+                continue
+
+            if accumulated_tokens >= next_threshold and injected_count < max_injections:
+                result.append({"role": "user", "content": condensed})
+                result.append({"role": "assistant", "content": "Understood."})
+                next_threshold += interval_tokens
+                injected_count += 1
+
+        if injected_count > 0:
+            logger.debug(
+                "Identity reinjection: inserted %d reminder(s) across ~%s tokens",
+                injected_count, f"{accumulated_tokens:,}",
+            )
+
+        return result
 
     @staticmethod
     def _sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -8108,6 +8186,11 @@ class AIAgent:
             # gated on context_compressor — so orphans from session loading or
             # manual message manipulation are always caught.
             api_messages = self._sanitize_api_messages(api_messages)
+
+            # Identity reinjection for large-context models: insert condensed
+            # SOUL.md reminders at ~25% token intervals to prevent persona
+            # drift in very long conversations.  API-call-time only.
+            api_messages = self._inject_identity_reminders(api_messages)
 
             # Normalize message whitespace and tool-call JSON for consistent
             # prefix matching.  Ensures bit-perfect prefixes across turns,

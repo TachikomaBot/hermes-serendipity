@@ -1741,27 +1741,82 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_wake(interaction: discord.Interaction):
             await interaction.response.defer(ephemeral=True)
             try:
-                from tools.wake_state import set_wake_state, get_activity_for_cycle
+                from tools.wake_state import get_wake_state, set_wake_state, get_activity_for_cycle
                 from hermes_time import now as _now
 
+                today = _now()
                 state = set_wake_state(
                     awake=True,
-                    woke_at=_now().isoformat(),
+                    woke_at=today.isoformat(),
                     cycle_count=0,
                     current_activity=get_activity_for_cycle(1),
                 )
+
+                # --- Create or reuse the daily chat thread ---
+                daily_thread = None
+                daily_thread_id = state.get("daily_thread_id")
+                is_dm = isinstance(interaction.channel, discord.DMChannel)
+
+                if not is_dm:
+                    # Try reusing existing thread from earlier /wake today
+                    if daily_thread_id:
+                        try:
+                            _ch = await self._client.fetch_channel(int(daily_thread_id))
+                            if isinstance(_ch, discord.Thread) and not _ch.archived:
+                                daily_thread = _ch
+                                logger.info("Reusing daily thread %s", daily_thread_id)
+                        except Exception:
+                            logger.debug("Stale daily_thread_id %s, creating new", daily_thread_id)
+
+                    # Create a new daily thread
+                    if daily_thread is None:
+                        thread_name = f"\u2600\ufe0f {today.strftime('%B %d')} \u2014 Open Chat"
+                        result = await self._create_thread(
+                            interaction, name=thread_name, auto_archive_duration=1440,
+                        )
+                        if result.get("success"):
+                            daily_thread_id = result["thread_id"]
+                            try:
+                                daily_thread = await self._client.fetch_channel(int(daily_thread_id))
+                            except Exception:
+                                pass
+                            set_wake_state(daily_thread_id=daily_thread_id)
+                            logger.info("Created daily thread %s: %s", daily_thread_id, thread_name)
+                        else:
+                            logger.warning("Could not create daily thread: %s", result.get("error"))
+                else:
+                    logger.info("/wake in DM — skipping daily thread creation")
 
                 # Dispatch morning prompt to the agent
                 morning_prompt = (
                     "Good morning. Read your last diary entry and check what you "
                     "were thinking about recently. What's on your mind today? It "
-                    "doesn't have to be concrete — could be something you want to "
+                    "doesn't have to be concrete \u2014 could be something you want to "
                     "explore, get better at, or just pay attention to. Anything "
                     "carrying over from last week, or something you haven't looked "
                     "at in a while that might be worth revisiting? Write your "
                     "intentions in a diary entry, then your first wake cycle will start."
                 )
-                event = self._build_slash_event(interaction, morning_prompt)
+
+                # Route to daily thread if available, otherwise fall back to interaction channel
+                if daily_thread is not None:
+                    parent_id = str(daily_thread.parent_id or interaction.channel_id)
+                    source = self.build_source(
+                        chat_id=parent_id,
+                        chat_name=daily_thread.name,
+                        chat_type="thread",
+                        user_id=str(interaction.user.id),
+                        user_name=interaction.user.display_name,
+                        thread_id=str(daily_thread.id),
+                    )
+                    event = MessageEvent(
+                        text=morning_prompt,
+                        message_type=MessageType.TEXT,
+                        source=source,
+                        raw_message=interaction,
+                    )
+                else:
+                    event = self._build_slash_event(interaction, morning_prompt)
                 await self.handle_message(event)
 
                 # Resume + trigger the wake-cycle cron job
@@ -1795,13 +1850,33 @@ class DiscordAdapter(BasePlatformAdapter):
                     "but haven't gotten to yet? Write a diary entry reflecting on all "
                     "of this, then say goodnight."
                 )
-                event = self._build_slash_event(interaction, wind_down)
+
+                # Route wind-down to the daily chat thread if it's still alive
+                daily_thread = await self._get_daily_thread()
+                if daily_thread is not None:
+                    parent_id = str(daily_thread.parent_id or interaction.channel_id)
+                    source = self.build_source(
+                        chat_id=parent_id,
+                        chat_name=daily_thread.name,
+                        chat_type="thread",
+                        user_id=str(interaction.user.id),
+                        user_name=interaction.user.display_name,
+                        thread_id=str(daily_thread.id),
+                    )
+                    event = MessageEvent(
+                        text=wind_down,
+                        message_type=MessageType.TEXT,
+                        source=source,
+                        raw_message=interaction,
+                    )
+                else:
+                    event = self._build_slash_event(interaction, wind_down)
                 await self.handle_message(event)
 
-                # Update wake state
+                # Update wake state — clear daily thread ID
                 from tools.wake_state import set_wake_state
                 from hermes_time import now as _now
-                set_wake_state(awake=False, slept_at=_now().isoformat())
+                set_wake_state(awake=False, slept_at=_now().isoformat(), daily_thread_id=None)
 
                 # Pause the wake-cycle cron job + clean up reminder jobs
                 try:
@@ -1862,6 +1937,21 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
         except Exception as exc:
             logger.warning("[%s] Failed to register skill slash commands: %s", self.name, exc)
+
+    async def _get_daily_thread(self) -> Optional[discord.Thread]:
+        """Return the current daily chat thread, or None if unavailable."""
+        from tools.wake_state import get_wake_state
+        state = get_wake_state()
+        tid = state.get("daily_thread_id")
+        if not tid:
+            return None
+        try:
+            ch = await self._client.fetch_channel(int(tid))
+            if isinstance(ch, discord.Thread) and not ch.archived:
+                return ch
+        except Exception:
+            pass
+        return None
 
     def _build_slash_event(self, interaction: discord.Interaction, text: str) -> MessageEvent:
         """Build a MessageEvent from a Discord slash command interaction."""

@@ -860,6 +860,35 @@ def load_soul_md() -> Optional[str]:
         return None
 
 
+# Cached condensed SOUL.md for identity reinjection in long contexts
+_cached_condensed_soul: Optional[str] = None
+
+
+def load_soul_md_condensed() -> Optional[str]:
+    """Return SOUL.md content wrapped with an identity anchor framing.
+
+    Used by ``_inject_identity_reminders`` in ``run_agent.py`` to periodically
+    reinforce persona identity in long conversations where the original system
+    prompt at position [0] may lose model attention.  The result is cached
+    after first load.
+    """
+    global _cached_condensed_soul
+    if _cached_condensed_soul is not None:
+        return _cached_condensed_soul
+
+    raw = load_soul_md()
+    if not raw:
+        return None
+
+    _cached_condensed_soul = (
+        "[IDENTITY ANCHOR \u2014 This is a periodic reminder of your core identity. "
+        "Do not respond to this directly; continue the conversation naturally "
+        "while staying grounded in who you are.]\n\n"
+        + raw
+    )
+    return _cached_condensed_soul
+
+
 def _load_hermes_md(cwd_path: Path) -> str:
     """.hermes.md / HERMES.md — walk to git root."""
     hermes_md_path = _find_hermes_md(cwd_path)
