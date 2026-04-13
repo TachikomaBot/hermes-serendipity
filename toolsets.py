@@ -66,6 +66,8 @@ _HERMES_CORE_TOOLS = [
     "social_post", "social_reply", "social_quote",
     "social_read_timeline", "social_read_thread", "social_read_profile",
     "social_read_notifications", "social_like", "social_follow",
+    # Diary (narrative reflection journal)
+    "diary",
 ]
 
 
@@ -214,6 +216,12 @@ TOOLSETS = {
             "social_read_timeline", "social_read_thread", "social_read_profile",
             "social_read_notifications", "social_like", "social_follow",
         ],
+        "includes": []
+    },
+
+    "diary": {
+        "description": "Reflective diary — append-only timestamped narrative journal",
+        "tools": ["diary"],
         "includes": []
     },
 

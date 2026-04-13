@@ -1736,6 +1736,76 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_btw(interaction: discord.Interaction, question: str):
             await self._run_simple_slash(interaction, f"/btw {question}")
 
+        # ── Wake / Sleep cycle controls ──────────────────────────────────
+        @tree.command(name="wake", description="Wake Serendipity up — start wake cycles")
+        async def slash_wake(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True)
+            try:
+                from tools.wake_state import set_wake_state, get_activity_for_cycle
+                from hermes_time import now as _now
+
+                state = set_wake_state(
+                    awake=True,
+                    woke_at=_now().isoformat(),
+                    cycle_count=0,
+                    current_activity=get_activity_for_cycle(1),
+                )
+
+                # Resume + trigger the wake-cycle cron job
+                try:
+                    from cron.jobs import list_jobs, resume_job, trigger_job
+                    for job in list_jobs(include_disabled=True):
+                        if job.get("name") == "wake-cycle":
+                            resume_job(job["id"])
+                            trigger_job(job["id"])
+                            break
+                except Exception as e:
+                    logger.warning("Could not trigger wake-cycle cron: %s", e)
+
+                await interaction.edit_original_response(
+                    content=f"Good morning~ \u2600\ufe0f Wake cycle started. First activity: {state['current_activity']}"
+                )
+            except Exception as e:
+                logger.error("/wake failed: %s", e, exc_info=True)
+                await interaction.edit_original_response(content=f"Wake failed: {e}")
+
+        @tree.command(name="sleep", description="Put Serendipity to sleep — stop wake cycles")
+        async def slash_sleep(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True)
+            try:
+                # Dispatch wind-down prompt to the agent
+                wind_down = (
+                    "Time to wind down for the day. Write a diary entry reflecting on "
+                    "today — what you did across your wake cycles, anything notable, "
+                    "and what you might want to pick up next time. Then say goodnight."
+                )
+                event = self._build_slash_event(interaction, wind_down)
+                await self.handle_message(event)
+
+                # Update wake state
+                from tools.wake_state import set_wake_state
+                from hermes_time import now as _now
+                set_wake_state(awake=False, slept_at=_now().isoformat())
+
+                # Pause the wake-cycle cron job + clean up reminder jobs
+                try:
+                    from cron.jobs import list_jobs, pause_job, remove_job
+                    for job in list_jobs(include_disabled=True):
+                        name = job.get("name", "")
+                        if name == "wake-cycle":
+                            pause_job(job["id"], reason="Handler sent /sleep")
+                        elif name.startswith("wake-reminder-"):
+                            remove_job(job["id"])
+                except Exception as e:
+                    logger.warning("Could not pause wake-cycle cron: %s", e)
+
+                await interaction.edit_original_response(
+                    content="Goodnight~ \U0001f319 Wake cycles paused."
+                )
+            except Exception as e:
+                logger.error("/sleep failed: %s", e, exc_info=True)
+                await interaction.edit_original_response(content=f"Sleep failed: {e}")
+
         # Register installed skills as native slash commands (parity with
         # Telegram, which uses telegram_menu_commands() in commands.py).
         # Discord allows up to 100 application commands globally.

@@ -160,6 +160,7 @@ def _discover_tools():
         "tools.homeassistant_tool",
         "tools.gui_tools",
         "tools.social_tools",
+        "tools.diary_tool",
     ]
     import importlib
     for mod_name in _modules:

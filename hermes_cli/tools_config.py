@@ -67,6 +67,7 @@ CONFIGURABLE_TOOLSETS = [
     ("homeassistant",    "🏠 Home Assistant",           "smart home device control"),
     ("gui",              "🖥️  GUI Interaction",           "screenshot, click, key, scroll via vision + xdotool"),
     ("social",           "📱 Social Media",              "post, reply, quote, read feeds, notifications, like, follow"),
+    ("diary",            "📔 Diary",                     "reflective journal entries"),
 ]
 
 # Toolsets that are OFF by default for new installs.
