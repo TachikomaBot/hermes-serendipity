@@ -279,6 +279,52 @@ class _BlueskyBackend:
         logger.info("social_quote: quoted %s", quoted_uri)
         return {"status": "quoted", "uri": response.uri, "cid": response.cid}
 
+    def thread(self, posts: List[str]) -> Dict:
+        """Post a thread (series of connected posts). All posts are validated
+        before any are published, so the thread either goes out in full or
+        not at all."""
+        if not posts:
+            return {"error": "No posts provided."}
+        for i, text in enumerate(posts):
+            if len(text) > 300:
+                return {
+                    "error": (
+                        f"Post {i + 1} of {len(posts)} is {len(text)} characters "
+                        f"but the limit is 300. Shorten it and try again."
+                    ),
+                }
+
+        client = self._ensure_client()
+        results = []
+
+        # First post
+        facets = _build_facets(posts[0], client)
+        resp = client.send_post(text=posts[0], facets=facets)
+        root_uri, root_cid = resp.uri, resp.cid
+        prev_uri, prev_cid = root_uri, root_cid
+        results.append({"index": 1, "uri": resp.uri, "cid": resp.cid})
+        logger.info("social_thread: posted 1/%d '%s'", len(posts), posts[0][:60])
+
+        # Subsequent posts reply to the previous one
+        from atproto import models
+        from atproto_client.models.com.atproto.repo.strong_ref import Main as StrongRef
+
+        for i, text in enumerate(posts[1:], start=2):
+            facets = _build_facets(text, client)
+            resp = client.send_post(
+                text=text,
+                reply_to=models.AppBskyFeedPost.ReplyRef(
+                    parent=StrongRef(uri=prev_uri, cid=prev_cid),
+                    root=StrongRef(uri=root_uri, cid=root_cid),
+                ),
+                facets=facets,
+            )
+            prev_uri, prev_cid = resp.uri, resp.cid
+            results.append({"index": i, "uri": resp.uri, "cid": resp.cid})
+            logger.info("social_thread: posted %d/%d '%s'", i, len(posts), text[:60])
+
+        return {"status": "thread_posted", "count": len(results), "posts": results}
+
     # -- reading -------------------------------------------------------------
 
     def get_timeline(self, feed: Optional[str] = None, limit: int = 25) -> List[Dict]:
@@ -496,6 +542,21 @@ def social_quote(args: dict, **kw) -> str:
         return json.dumps({"error": str(e)})
 
 
+def social_thread(args: dict, **kw) -> str:
+    platform = args.get("platform", "bluesky")
+    if platform != "bluesky":
+        return json.dumps({"error": f"Unsupported platform: {platform}"})
+    posts = args.get("posts", [])
+    if not isinstance(posts, list):
+        return json.dumps({"error": "posts must be a list of strings."})
+    try:
+        result = _backend.thread(posts=posts)
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as e:
+        logger.error("social_thread error: %s", e, exc_info=True)
+        return json.dumps({"error": str(e)})
+
+
 def social_read_timeline(args: dict, **kw) -> str:
     platform = args.get("platform", "bluesky")
     if platform != "bluesky":
@@ -681,6 +742,32 @@ SOCIAL_QUOTE_SCHEMA = {
     },
 }
 
+SOCIAL_THREAD_SCHEMA = {
+    "name": "social_thread",
+    "description": (
+        "Post a thread (series of connected posts). Each post must be 300 "
+        "characters or fewer. All posts are validated before any are published, "
+        "so the thread either goes out in full or not at all. Use this when you "
+        "want to say something that doesn't fit in a single post."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "platform": {
+                "type": "string",
+                "enum": ["bluesky"],
+                "description": "Social media platform (default: bluesky).",
+            },
+            "posts": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of post texts, in order. Each must be <= 300 characters.",
+            },
+        },
+        "required": ["posts"],
+    },
+}
+
 SOCIAL_READ_TIMELINE_SCHEMA = {
     "name": "social_read_timeline",
     "description": (
@@ -831,6 +918,7 @@ _SOCIAL_TOOLS = [
     ("social_post",               SOCIAL_POST_SCHEMA,               social_post,               "📝", "Post to social media"),
     ("social_reply",              SOCIAL_REPLY_SCHEMA,              social_reply,              "💬", "Reply to a post"),
     ("social_quote",              SOCIAL_QUOTE_SCHEMA,              social_quote,              "🔁", "Quote a post"),
+    ("social_thread",             SOCIAL_THREAD_SCHEMA,             social_thread,             "🧵", "Post a thread"),
     ("social_read_timeline",      SOCIAL_READ_TIMELINE_SCHEMA,      social_read_timeline,      "📰", "Read social media feed"),
     ("social_read_thread",        SOCIAL_READ_THREAD_SCHEMA,        social_read_thread,        "🧵", "Read a post thread"),
     ("social_read_profile",       SOCIAL_READ_PROFILE_SCHEMA,       social_read_profile,       "👤", "Read a user profile"),
