@@ -47,7 +47,7 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
 })
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import get_due_jobs, get_job, mark_job_run, save_job_output, advance_next_run
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -593,6 +593,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     job_id = job["id"]
     job_name = job["name"]
     prompt = _build_job_prompt(job)
+    # Re-read the job from disk after building the prompt, because the
+    # pre-run script may have modified the job (e.g. created a new Discord
+    # thread and updated the origin.thread_id for delivery routing).
+    _refreshed = get_job(job_id)
+    if _refreshed:
+        job = _refreshed
     origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -747,8 +753,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             provider_sort=pr.get("sort"),
             disabled_toolsets=["cronjob", "messaging", "clarify"],
             quiet_mode=True,
-            skip_context_files=True,  # Don't inject SOUL.md/AGENTS.md from scheduler cwd
-            skip_memory=True,  # Cron system prompts would corrupt user representations
+            # Persona mode: load SOUL.md + memory when the job needs the agent's
+            # identity (wake cycles, social posting, etc.).  Default off because
+            # generic cron jobs shouldn't carry persona/memory context.
+            skip_context_files=not job.get("persona", False),
+            skip_memory=not job.get("persona", False),
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
@@ -961,8 +970,11 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
                 delivery_error = None
                 if should_deliver:
+                    # Re-read the job from disk in case a pre-run script updated
+                    # the origin (e.g. created a new Discord thread for delivery).
+                    _fresh_job = get_job(job["id"]) or job
                     try:
-                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                        delivery_error = _deliver_result(_fresh_job, deliver_content, adapters=adapters, loop=loop)
                     except Exception as de:
                         delivery_error = str(de)
                         logger.error("Delivery failed for job %s: %s", job["id"], de)

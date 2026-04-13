@@ -378,6 +378,7 @@ def create_job(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     script: Optional[str] = None,
+    persona: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -397,6 +398,9 @@ def create_job(
         script: Optional path to a Python script whose stdout is injected into the
                 prompt each run.  The script runs before the agent turn, and its output
                 is prepended as context.  Useful for data collection / change detection.
+        persona: If True, load SOUL.md and memory (MEMORY.md/USER.md) into the
+                 cron session.  Use this for jobs where the agent needs its identity
+                 and context (e.g. wake cycles, social posting).
 
     Returns:
         The created job dict
@@ -458,6 +462,8 @@ def create_job(
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
+        # Persona mode: load SOUL.md + memory into cron session
+        "persona": bool(persona),
     }
 
     jobs = load_jobs()
