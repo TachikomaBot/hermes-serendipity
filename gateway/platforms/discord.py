@@ -1751,6 +1751,19 @@ class DiscordAdapter(BasePlatformAdapter):
                     current_activity=get_activity_for_cycle(1),
                 )
 
+                # Dispatch morning prompt to the agent
+                morning_prompt = (
+                    "Good morning. Read your last diary entry and check what you "
+                    "were thinking about recently. What's on your mind today? It "
+                    "doesn't have to be concrete — could be something you want to "
+                    "explore, get better at, or just pay attention to. Anything "
+                    "carrying over from last week, or something you haven't looked "
+                    "at in a while that might be worth revisiting? Write your "
+                    "intentions in a diary entry, then your first wake cycle will start."
+                )
+                event = self._build_slash_event(interaction, morning_prompt)
+                await self.handle_message(event)
+
                 # Resume + trigger the wake-cycle cron job
                 try:
                     from cron.jobs import list_jobs, resume_job, trigger_job
@@ -1775,9 +1788,12 @@ class DiscordAdapter(BasePlatformAdapter):
             try:
                 # Dispatch wind-down prompt to the agent
                 wind_down = (
-                    "Time to wind down for the day. Write a diary entry reflecting on "
-                    "today — what you did across your wake cycles, anything notable, "
-                    "and what you might want to pick up next time. Then say goodnight."
+                    "Time to wind down for the day. Read back your morning intentions "
+                    "and your diary entries from today. How did it go? What's carrying "
+                    "over to tomorrow? Is there anything from this past week you want "
+                    "to pick up again, or something you've been meaning to look into "
+                    "but haven't gotten to yet? Write a diary entry reflecting on all "
+                    "of this, then say goodnight."
                 )
                 event = self._build_slash_event(interaction, wind_down)
                 await self.handle_message(event)
