@@ -139,8 +139,10 @@ class _BlueskyBackend:
 
     def post(self, text: str, image_path: Optional[str] = None) -> Dict:
         client = self._ensure_client()
+        truncated = False
         if len(text) > 300:
             text = text[:297] + "..."
+            truncated = True
 
         embed = None
         if image_path and os.path.isfile(image_path):
@@ -159,12 +161,17 @@ class _BlueskyBackend:
 
         response = client.send_post(text=text, embed=embed)
         logger.info("social_post: posted '%s'", text[:80])
-        return {"status": "posted", "uri": response.uri, "cid": response.cid}
+        result = {"status": "posted", "uri": response.uri, "cid": response.cid}
+        if truncated:
+            result["warning"] = "Text exceeded 300 chars and was truncated. Write shorter posts or split into a thread using social_reply to yourself."
+        return result
 
     def reply(self, text: str, parent_uri: str, parent_cid: str) -> Dict:
         client = self._ensure_client()
+        truncated = False
         if len(text) > 300:
             text = text[:297] + "..."
+            truncated = True
 
         from atproto import models
         from atproto_client.models.com.atproto.repo.strong_ref import Main as StrongRef
@@ -199,12 +206,17 @@ class _BlueskyBackend:
             ),
         )
         logger.info("social_reply: replied to %s", parent_uri)
-        return {"status": "replied", "uri": response.uri, "cid": response.cid}
+        result = {"status": "replied", "uri": response.uri, "cid": response.cid}
+        if truncated:
+            result["warning"] = "Text exceeded 300 chars and was truncated."
+        return result
 
     def quote_post(self, text: str, quoted_uri: str, quoted_cid: str) -> Dict:
         client = self._ensure_client()
+        truncated = False
         if len(text) > 300:
             text = text[:297] + "..."
+            truncated = True
 
         from atproto_client.models.com.atproto.repo.strong_ref import Main as StrongRef
         from atproto_client.models.app.bsky.embed.record import Main as EmbedRecord
@@ -212,7 +224,10 @@ class _BlueskyBackend:
         embed = EmbedRecord(record=StrongRef(uri=quoted_uri, cid=quoted_cid))
         response = client.send_post(text=text, embed=embed)
         logger.info("social_quote: quoted %s", quoted_uri)
-        return {"status": "quoted", "uri": response.uri, "cid": response.cid}
+        result = {"status": "quoted", "uri": response.uri, "cid": response.cid}
+        if truncated:
+            result["warning"] = "Text exceeded 300 chars and was truncated."
+        return result
 
     # -- reading -------------------------------------------------------------
 
@@ -405,8 +420,8 @@ def social_reply(args: dict, **kw) -> str:
     try:
         result = _backend.reply(
             text=args.get("text", ""),
-            uri=args.get("uri", ""),
-            cid=args.get("cid", ""),
+            parent_uri=args.get("uri", ""),
+            parent_cid=args.get("cid", ""),
         )
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
@@ -421,8 +436,8 @@ def social_quote(args: dict, **kw) -> str:
     try:
         result = _backend.quote_post(
             text=args.get("text", ""),
-            uri=args.get("uri", ""),
-            cid=args.get("cid", ""),
+            quoted_uri=args.get("uri", ""),
+            quoted_cid=args.get("cid", ""),
         )
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
