@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("tools.social_tools")
@@ -47,6 +48,39 @@ def _is_following_me(viewer) -> bool:
     return bool(getattr(viewer, "followed_by", None))
 
 
+def _whitelist_path() -> Path:
+    """Path to the social interaction whitelist file."""
+    try:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "state" / "social_whitelist.json"
+    except ImportError:
+        return Path.home() / ".hermes" / "state" / "social_whitelist.json"
+
+
+def _load_whitelist() -> set:
+    path = _whitelist_path()
+    if not path.exists():
+        return set()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return {h.lower() for h in data.get("handles", [])}
+    except Exception:
+        return set()
+
+
+def _save_whitelist(handles: set):
+    path = _whitelist_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"handles": sorted(handles)}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _is_whitelisted(handle: str) -> bool:
+    return handle.lower() in _load_whitelist()
+
+
 def _extract_images(post_view) -> List[str]:
     """Extract image URLs from post embeds (best-effort)."""
     images: List[str] = []
@@ -81,6 +115,7 @@ def _enrich_post(post_view) -> Dict[str, Any]:
             "display_name": getattr(author, "display_name", "") or author.handle,
             "is_bot": _is_bot(getattr(author, "labels", [])),
             "is_following_me": _is_following_me(getattr(author, "viewer", None)),
+            "is_whitelisted": _is_whitelisted(author.handle),
         },
         "text": getattr(record, "text", "") if record else "",
         "created_at": str(getattr(record, "created_at", "")) if record else "",
@@ -510,14 +545,41 @@ def social_post(args: dict, **kw) -> str:
         return json.dumps({"error": str(e)})
 
 
+def _check_whitelist(uri: str) -> Optional[str]:
+    """Check if the author of a post is whitelisted. Returns a JSON error
+    string if not whitelisted, or None if the interaction is allowed."""
+    try:
+        client = _backend._ensure_client()
+        posts = client.get_posts([uri])
+        if posts.posts:
+            handle = posts.posts[0].author.handle
+            if not _is_whitelisted(handle):
+                rkey = uri.split("/")[-1]
+                link = f"https://bsky.app/profile/{handle}/post/{rkey}"
+                return json.dumps({
+                    "error": (
+                        f"@{handle} is not whitelisted for interaction. "
+                        f"Ask your handler for approval before replying/quoting. "
+                        f"Post: {link}"
+                    ),
+                })
+    except Exception as e:
+        logger.debug("Whitelist check failed for %s: %s", uri, e)
+    return None
+
+
 def social_reply(args: dict, **kw) -> str:
     platform = args.get("platform", "bluesky")
     if platform != "bluesky":
         return json.dumps({"error": f"Unsupported platform: {platform}"})
+    uri = args.get("uri", "")
+    blocked = _check_whitelist(uri)
+    if blocked:
+        return blocked
     try:
         result = _backend.reply(
             text=args.get("text", ""),
-            parent_uri=args.get("uri", ""),
+            parent_uri=uri,
             parent_cid=args.get("cid", ""),
         )
         return json.dumps(result, ensure_ascii=False)
@@ -530,10 +592,14 @@ def social_quote(args: dict, **kw) -> str:
     platform = args.get("platform", "bluesky")
     if platform != "bluesky":
         return json.dumps({"error": f"Unsupported platform: {platform}"})
+    uri = args.get("uri", "")
+    blocked = _check_whitelist(uri)
+    if blocked:
+        return blocked
     try:
         result = _backend.quote_post(
             text=args.get("text", ""),
-            quoted_uri=args.get("uri", ""),
+            quoted_uri=uri,
             quoted_cid=args.get("cid", ""),
         )
         return json.dumps(result, ensure_ascii=False)
@@ -635,6 +701,38 @@ def social_follow(args: dict, **kw) -> str:
         return json.dumps({"error": str(e)})
 
 
+def social_whitelist(args: dict, **kw) -> str:
+    action = args.get("action", "")
+    handle = args.get("handle", "").strip().lower()
+
+    if action == "list":
+        handles = sorted(_load_whitelist())
+        return json.dumps({"whitelisted": handles, "count": len(handles)})
+
+    if action == "check":
+        if not handle:
+            return json.dumps({"error": "handle is required for check action"})
+        return json.dumps({"handle": handle, "whitelisted": _is_whitelisted(handle)})
+
+    if action == "add":
+        if not handle:
+            return json.dumps({"error": "handle is required for add action"})
+        wl = _load_whitelist()
+        wl.add(handle)
+        _save_whitelist(wl)
+        return json.dumps({"ok": True, "added": handle})
+
+    if action == "remove":
+        if not handle:
+            return json.dumps({"error": "handle is required for remove action"})
+        wl = _load_whitelist()
+        wl.discard(handle)
+        _save_whitelist(wl)
+        return json.dumps({"ok": True, "removed": handle})
+
+    return json.dumps({"error": f"Unknown action: {action}"})
+
+
 # ---------------------------------------------------------------------------
 # Check function
 # ---------------------------------------------------------------------------
@@ -686,8 +784,9 @@ SOCIAL_POST_SCHEMA = {
 SOCIAL_REPLY_SCHEMA = {
     "name": "social_reply",
     "description": (
-        "Reply to an existing post. Automatically resolves the thread root "
-        "for proper threading."
+        "Reply to an existing post. The target account must be whitelisted — "
+        "if not, the tool returns an error with the post link. Ask your "
+        "handler for approval, then use social_whitelist to add the account."
     ),
     "parameters": {
         "type": "object",
@@ -716,7 +815,12 @@ SOCIAL_REPLY_SCHEMA = {
 
 SOCIAL_QUOTE_SCHEMA = {
     "name": "social_quote",
-    "description": "Quote an existing post with your own commentary.",
+    "description": (
+        "Quote an existing post with your own commentary. The target account "
+        "must be whitelisted — if not, the tool returns an error with the post "
+        "link. Ask your handler for approval, then use social_whitelist to add "
+        "the account."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -909,6 +1013,31 @@ SOCIAL_FOLLOW_SCHEMA = {
 }
 
 
+SOCIAL_WHITELIST_SCHEMA = {
+    "name": "social_whitelist",
+    "description": (
+        "Manage the social interaction whitelist. Accounts on this list "
+        "can be replied to or quoted freely. Use 'add' after getting "
+        "handler approval to interact with a new account."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["add", "remove", "list", "check"],
+                "description": "Action to perform.",
+            },
+            "handle": {
+                "type": "string",
+                "description": "Bluesky handle (e.g. user.bsky.social). Required for add/remove/check.",
+            },
+        },
+        "required": ["action"],
+    },
+}
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -925,6 +1054,7 @@ _SOCIAL_TOOLS = [
     ("social_read_notifications", SOCIAL_READ_NOTIFICATIONS_SCHEMA, social_read_notifications, "🔔", "Check social notifications"),
     ("social_like",               SOCIAL_LIKE_SCHEMA,               social_like,               "❤️", "Like a post"),
     ("social_follow",             SOCIAL_FOLLOW_SCHEMA,             social_follow,             "➕", "Follow a user"),
+    ("social_whitelist",          SOCIAL_WHITELIST_SCHEMA,          social_whitelist,          "✅", "Manage interaction whitelist"),
 ]
 
 for _name, _schema, _handler, _emoji, _desc in _SOCIAL_TOOLS:
