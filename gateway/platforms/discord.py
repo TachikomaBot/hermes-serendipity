@@ -1738,7 +1738,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # ── Wake / Sleep cycle controls ──────────────────────────────────
         @tree.command(name="wake", description="Wake Serendipity up — start wake cycles")
-        async def slash_wake(interaction: discord.Interaction):
+        @discord.app_commands.describe(message="Optional message to include with the wake-up prompt")
+        async def slash_wake(interaction: discord.Interaction, message: str = ""):
             await interaction.response.defer(ephemeral=True)
             try:
                 from tools.wake_state import get_wake_state, set_wake_state, get_activity_for_cycle
@@ -1797,6 +1798,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     "at in a while that might be worth revisiting? Write your "
                     "intentions in a diary entry, then your first wake cycle will start."
                 )
+                if message.strip():
+                    morning_prompt = f"{message.strip()}\n\n{morning_prompt}"
 
                 # Route to daily thread if available, otherwise fall back to interaction channel
                 if daily_thread is not None:
