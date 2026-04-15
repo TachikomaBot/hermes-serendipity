@@ -1749,6 +1749,64 @@ class BasePlatformAdapter(ABC):
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
 
+            # Check for autonomous self_continue request
+            try:
+                from tools.continuation import pop_continuation, cancel_continuation
+                cont = pop_continuation(session_key)
+                if cont and session_key not in self._pending_messages:
+                    _cont_delay = cont.get("delay", 45)
+                    _cont_status = cont.get("status", "")
+
+                    # Show status indicator in the thread
+                    if _cont_status:
+                        try:
+                            await self._send_with_retry(
+                                chat_id=event.source.chat_id,
+                                content=f"\u23f3 *continuing in {_cont_delay}s \u2014 {_cont_status}*",
+                                metadata=_thread_metadata,
+                            )
+                        except Exception:
+                            pass  # non-fatal
+
+                    # Wait with interrupt checking (1s granularity)
+                    _cont_interrupted = False
+                    for _ in range(_cont_delay):
+                        if interrupt_event.is_set() or session_key in self._pending_messages:
+                            _cont_interrupted = True
+                            break
+                        await asyncio.sleep(1)
+
+                    if not _cont_interrupted:
+                        # Clear any stale signal that may have been re-set
+                        cancel_continuation(session_key)
+
+                        # Build synthetic continuation event
+                        _cont_event = MessageEvent(
+                            text=(
+                                "[Autonomous continuation] You called self_continue. "
+                                "Keep going with what you were doing. Call self_continue "
+                                "again if you have more to do, or stop if you're done."
+                            ),
+                            message_type=MessageType.TEXT,
+                            source=event.source,
+                            internal=True,
+                        )
+
+                        # Clean up current session before re-entering
+                        if session_key in self._active_sessions:
+                            del self._active_sessions[session_key]
+                        typing_task.cancel()
+                        try:
+                            await typing_task
+                        except asyncio.CancelledError:
+                            pass
+
+                        # Process continuation as new turn in same session
+                        await self._process_message_background(_cont_event, session_key)
+                        return  # Already cleaned up
+            except ImportError:
+                pass  # tools.continuation not available — skip
+
             # Check if there's a pending message that was queued during our processing
             if session_key in self._pending_messages:
                 pending_event = self._pending_messages.pop(session_key)
