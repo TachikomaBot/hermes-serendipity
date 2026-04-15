@@ -1841,6 +1841,47 @@ class DiscordAdapter(BasePlatformAdapter):
                 except Exception as e:
                     logger.warning("Could not trigger wake-cycle cron: %s", e)
 
+                # Schedule wake-period reminders at +5m, +10m, +15m
+                try:
+                    from cron.jobs import create_job, remove_job
+                    from datetime import timedelta
+
+                    # Clean up any stale reminder jobs from a previous cycle
+                    for job in list_jobs(include_disabled=True):
+                        if job.get("name", "").startswith("wake-reminder-"):
+                            remove_job(job["id"])
+
+                    thread_origin = None
+                    if daily_thread is not None:
+                        thread_origin = {
+                            "platform": "discord",
+                            "chat_id": str(daily_thread.parent_id or interaction.channel_id),
+                            "thread_id": str(daily_thread.id),
+                        }
+
+                    reminders = [
+                        (5,  "wake-reminder-5m",  "\u23f0 10 minutes remaining in this wake cycle."),
+                        (10, "wake-reminder-10m", "\u23f0 5 minutes remaining \u2014 start thinking about your diary entry."),
+                        (15, "wake-reminder-15m",
+                         "\u23f0 Time\u2019s up. Write your diary entry now and wind down. "
+                         "Wrap up whatever you\u2019re doing \u2014 save your game if applicable, "
+                         "post any final thoughts, then write a diary entry reflecting on "
+                         "this cycle. This is your last act before sleep."),
+                    ]
+                    for offset_min, name, prompt in reminders:
+                        fire_at = (today + timedelta(minutes=offset_min)).isoformat()
+                        create_job(
+                            prompt=prompt,
+                            schedule=fire_at,
+                            name=name,
+                            deliver="origin",
+                            origin=thread_origin,
+                            persona=True,
+                        )
+                    logger.info("Scheduled %d wake reminders", len(reminders))
+                except Exception as e:
+                    logger.warning("Could not schedule wake reminders: %s", e)
+
                 await interaction.edit_original_response(
                     content=f"Good morning~ \u2600\ufe0f Wake cycle started. First activity: {state['current_activity']}"
                 )
