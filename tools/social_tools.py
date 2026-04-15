@@ -442,16 +442,21 @@ class _BlueskyBackend:
             result["recent_posts"] = []
         return result
 
-    def get_notifications(self, limit: int = 25) -> List[Dict]:
+    def get_notifications(self, limit: int = 25, unread_only: bool = True) -> List[Dict]:
         client = self._ensure_client()
         limit = max(1, min(limit, 100))
 
         response = client.app.bsky.notification.list_notifications({"limit": limit})
 
+        # Filter to unread notifications by default to prevent duplicate replies
+        raw_notifs = response.notifications
+        if unread_only:
+            raw_notifs = [n for n in raw_notifs if not n.is_read]
+
         # Batch-resolve post content for reply/mention/quote notifications
         post_uris = [
             n.uri
-            for n in response.notifications
+            for n in raw_notifs
             if n.reason in ("reply", "mention", "quote")
         ]
         posts_by_uri: Dict = {}
@@ -464,7 +469,7 @@ class _BlueskyBackend:
                 logger.debug("Failed to batch-resolve notification posts")
 
         notifs = []
-        for n in response.notifications:
+        for n in raw_notifs:
             author = n.author
             entry: Dict[str, Any] = {
                 "reason": n.reason,
@@ -473,6 +478,7 @@ class _BlueskyBackend:
                     "display_name": getattr(author, "display_name", "") or author.handle,
                     "is_bot": _is_bot(getattr(author, "labels", [])),
                     "is_following_me": _is_following_me(getattr(author, "viewer", None)),
+                    "is_whitelisted": _is_whitelisted(author.handle),
                 },
                 "is_read": n.is_read,
                 "uri": n.uri,
@@ -491,6 +497,17 @@ class _BlueskyBackend:
                         entry["parent_uri"] = getattr(parent, "uri", None)
                         entry["parent_cid"] = getattr(parent, "cid", None)
             notifs.append(entry)
+
+        # Mark notifications as seen so next call doesn't return the same ones
+        if notifs:
+            try:
+                from datetime import datetime, timezone
+                client.app.bsky.notification.update_seen(
+                    {"seen_at": datetime.now(timezone.utc).isoformat()}
+                )
+            except Exception:
+                logger.debug("Failed to mark notifications as seen")
+
         return notifs
 
     # -- engagement ----------------------------------------------------------
@@ -670,7 +687,10 @@ def social_read_notifications(args: dict, **kw) -> str:
     if platform != "bluesky":
         return json.dumps({"error": f"Unsupported platform: {platform}"})
     try:
-        notifs = _backend.get_notifications(limit=args.get("limit", 25))
+        notifs = _backend.get_notifications(
+            limit=args.get("limit", 25),
+            unread_only=args.get("unread_only", True),
+        )
         return json.dumps({"status": "ok", "count": len(notifs), "notifications": notifs}, ensure_ascii=False)
     except Exception as e:
         logger.error("social_read_notifications error: %s", e, exc_info=True)
@@ -949,7 +969,9 @@ SOCIAL_READ_NOTIFICATIONS_SCHEMA = {
     "name": "social_read_notifications",
     "description": (
         "Check recent notifications: likes, replies, follows, mentions, quotes. "
-        "Reply and mention notifications include the full post text."
+        "Reply and mention notifications include the full post text. "
+        "By default only returns unread notifications and marks them as seen, "
+        "preventing duplicate processing."
     ),
     "parameters": {
         "type": "object",
@@ -962,6 +984,10 @@ SOCIAL_READ_NOTIFICATIONS_SCHEMA = {
             "limit": {
                 "type": "integer",
                 "description": "Max notifications to return (default 25, max 100).",
+            },
+            "unread_only": {
+                "type": "boolean",
+                "description": "Only return unread notifications (default true). Set false to include already-seen ones.",
             },
         },
         "required": [],

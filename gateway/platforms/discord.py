@@ -1822,11 +1822,19 @@ class DiscordAdapter(BasePlatformAdapter):
                     event = self._build_slash_event(interaction, morning_prompt)
                 await self.handle_message(event)
 
-                # Resume + trigger the wake-cycle cron job
+                # Resume + trigger the wake-cycle cron job, routing to daily thread
                 try:
-                    from cron.jobs import list_jobs, resume_job, trigger_job
+                    from cron.jobs import list_jobs, resume_job, trigger_job, update_job
                     for job in list_jobs(include_disabled=True):
                         if job.get("name") == "wake-cycle":
+                            # Update origin to point at the daily thread so
+                            # wind-down messages land there, not general channel
+                            if daily_thread is not None:
+                                origin = job.get("origin", {})
+                                origin["thread_id"] = str(daily_thread.id)
+                                origin["chat_id"] = str(daily_thread.parent_id or interaction.channel_id)
+                                origin["platform"] = "discord"
+                                update_job(job["id"], {"origin": origin})
                             resume_job(job["id"])
                             trigger_job(job["id"])
                             break
