@@ -68,6 +68,7 @@ CONFIGURABLE_TOOLSETS = [
     ("gui",              "🖥️  GUI Interaction",           "screenshot, click, key, scroll via vision + xdotool"),
     ("social",           "📱 Social Media",              "post, reply, quote, read feeds, notifications, like, follow"),
     ("diary",            "📔 Diary",                     "reflective journal entries"),
+    ("session",          "🔄 Session Control",            "autonomous continuation (self_continue)"),
 ]
 
 # Toolsets that are OFF by default for new installs.

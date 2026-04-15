@@ -236,6 +236,19 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
             return f"-{target}: \"{_oneline(args.get('old_text', '')[:20])}\""
         return action
 
+    if tool_name == "diary":
+        action = args.get("action", "")
+        if action == "write":
+            content = _oneline(args.get("content", ""))
+            return f"writing: \"{content[:30]}{'...' if len(content) > 30 else ''}\""
+        elif action == "read":
+            date = args.get("date", "today")
+            days = args.get("days", 1)
+            return f"reading {date}" if days == 1 else f"reading {days}d from {date}"
+        elif action == "list":
+            return "listing entries"
+        return action
+
     if tool_name == "send_message":
         target = args.get("target", "?")
         msg = _oneline(args.get("message", ""))
