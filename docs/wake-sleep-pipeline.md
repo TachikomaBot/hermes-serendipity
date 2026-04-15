@@ -165,40 +165,139 @@ The `thread_id` field flows through:
 
 ---
 
-## Known Gaps
+## Pre-Run Script: `wake_cycle_pre.py`
 
-### 1. Autonomous wake has no thread or reminders
-When the wake-cycle cron fires on its own (not via `/wake`):
-- No daily thread is created
-- No reminders are scheduled
-- Wake state is NOT updated (`awake` stays `False`)
-- The cron prompt tells the agent about reminders that won't come
+**Location:** `~/.hermes/scripts/wake_cycle_pre.py` (VPS), `scripts/wake_cycle_pre.py` (repo)
 
-**Impact:** Agent runs with no time awareness, no thread for conversation, and
-delivers output to whatever `origin` was last set (possibly stale thread from
-previous day, or general channel).
+Runs before every wake-cycle cron fire. Handles both autonomous wake and mid-day
+cycle increment. The cron scheduler re-reads the job after the script runs, so
+origin updates take effect for delivery routing.
 
-**Fix needed:** Either:
-- Add a pre-run script to the wake-cycle job that creates the thread and reminders
-- Or move the thread/reminder logic into the cron execution path
+### What it does
 
-### 2. No hard cutoff after 15 minutes
-The 15-minute reminder tells the agent to stop, but nothing forces it. If the
-agent is mid-game-turn with many tool calls, the reminder arrives as a cron
-delivery — it doesn't interrupt the active session.
+1. **Loads `.env`** — `DISCORD_BOT_TOKEN` needed for thread creation
+2. **Reads `DISCORD_HOME_CHANNEL`** from env or `config.yaml`
+3. **Determines wake mode:**
+   - `awake=False` → autonomous wake: sets `awake=True`, `woke_at=now`, `cycle_count=1`
+   - `awake=True` → mid-day cycle: increments `cycle_count`
+4. **Rotates activity** — gaming → social → research
+5. **Creates or reuses daily thread:**
+   - Checks `daily_thread_id` in state — verifies thread exists and not archived
+   - If missing/stale: creates new thread via short-lived discord.py client
+   - Thread name: `"☀️ April 15 — Open Chat"`
+6. **Updates wake-cycle job origin** — writes `thread_id` directly to `jobs.json`
+7. **Schedules reminders** — creates 4 one-shot cron jobs:
 
-**Impact:** Agent can run well past 15 minutes if it's in a long tool chain.
+| Job | Fires at | Persona | Script | Purpose |
+|-----|----------|---------|--------|---------|
+| `wake-reminder-5m` | +5 min | Yes | — | "⏰ 10 minutes remaining" |
+| `wake-reminder-10m` | +10 min | Yes | — | "⏰ 5 minutes remaining" |
+| `wake-reminder-15m` | +15 min | Yes | — | Wind-down prompt |
+| `wake-reminder-cutoff` | +18 min | No | `wake_cycle_force_sleep.py` | Hard cutoff |
 
-**Fix consideration:** The reminder could trigger `/sleep` automatically, or
-set a flag that the gateway checks to interrupt the session.
+8. **Outputs context** — cycle number, activity, status (prepended to prompt)
 
-### 3. Wake-cycle `deliver` field
-The wake-cycle job has `deliver: "discord"` (from original creation), not
-`deliver: "origin"`. This means `_resolve_delivery_target()` may fall back
-to `DISCORD_HOME_CHANNEL` instead of using the origin's thread_id.
+### Thread creation note
 
-**Fix:** Update the job's `deliver` field to `"origin"` so it uses the
-thread_id that `/wake` sets.
+The VPS is blocked from Discord's REST API by Cloudflare (error 1010). Thread
+creation uses a short-lived discord.py websocket client instead (~5s connect,
+create, disconnect). This works even while the gateway is running.
+
+---
+
+## Force-Sleep Backstop: `wake_cycle_force_sleep.py`
+
+**Location:** `~/.hermes/scripts/wake_cycle_force_sleep.py` (VPS), `scripts/wake_cycle_force_sleep.py` (repo)
+
+Fires at +18 minutes (3-minute grace after the 15-minute wind-down). Ensures the
+agent doesn't run indefinitely if it doesn't comply with the wind-down prompt.
+
+### What it does
+
+1. Checks if already asleep — exits `[SILENT]` if so
+2. Sets `awake=False`, `slept_at=now` in wake state
+3. Pauses the wake-cycle cron job (reason: "Hard cutoff after 18 minutes")
+4. Outputs a hard-stop message delivered to the thread
+
+---
+
+## Resolved Issues
+
+### 1. Autonomous wake — thread, reminders, and state (FIXED)
+The pre-run script (`wake_cycle_pre.py`) now handles the full wake setup for
+both autonomous cron fires and `/wake` command triggers. Creates daily thread,
+schedules reminders, updates wake state and job origin.
+
+### 2. Hard cutoff after 15 minutes (FIXED)
+The `wake_cycle_force_sleep.py` script fires at +18 minutes as a backstop.
+Sets `awake=False` and pauses the cron, delivering a hard-stop message to
+the thread.
+
+### 3. Wake-cycle `deliver` field (FIXED)
+Changed from `"discord"` to `"origin"` so delivery uses the thread_id from
+the job's origin field.
+
+---
+
+## Dry-Run / Testing
+
+To test the wake pipeline without triggering a real agent session:
+
+```bash
+# 1. Reset wake state to sleeping
+ssh root@VPS 'python3 -c "
+import json; from pathlib import Path
+p = Path.home() / \".hermes/state/wake_state.json\"
+s = json.loads(p.read_text())
+s[\"awake\"] = False
+s[\"daily_thread_id\"] = None
+p.write_text(json.dumps(s, indent=2))
+print(\"Reset to sleeping\")
+"'
+
+# 2. Run the pre-run script standalone
+ssh root@VPS 'cd /opt/hermes-serendipity && venv/bin/python ~/.hermes/scripts/wake_cycle_pre.py 2>&1'
+
+# Expected output (no errors):
+#   Wake cycle #1
+#   Suggested activity: gaming
+#   Status: just woke up (autonomous)
+#   Discord thread: ☀️ April 15 — Open Chat
+
+# 3. Verify state and jobs
+ssh root@VPS 'cat ~/.hermes/state/wake_state.json'
+# Should show: awake=true, daily_thread_id set
+
+ssh root@VPS 'cd /opt/hermes-serendipity && venv/bin/python -c "
+from cron.jobs import list_jobs
+for j in list_jobs(include_disabled=True):
+    n = j.get(\"name\",\"\")
+    if n.startswith(\"wake-reminder\") or n == \"wake-cycle\":
+        print(n, \"|\", j.get(\"deliver\"), \"|\", j.get(\"origin\"))
+"'
+# Should show: wake-cycle with thread_id in origin, 4 reminders with thread_id
+
+# 4. Clean up after test
+ssh root@VPS 'cd /opt/hermes-serendipity && venv/bin/python3 -c "
+import json
+from pathlib import Path
+from cron.jobs import list_jobs, remove_job, pause_job
+
+p = Path.home() / \".hermes/state/wake_state.json\"
+s = json.loads(p.read_text())
+s[\"awake\"] = False
+s[\"daily_thread_id\"] = None
+p.write_text(json.dumps(s, indent=2))
+
+for j in list_jobs(include_disabled=True):
+    name = j.get(\"name\", \"\")
+    if name == \"wake-cycle\":
+        pause_job(j[\"id\"], reason=\"Test cleanup\")
+    elif name.startswith(\"wake-reminder-\"):
+        remove_job(j[\"id\"])
+print(\"Cleaned up\")
+"'
+```
 
 ---
 
@@ -210,5 +309,7 @@ thread_id that `/wake` sets.
 | Wake state management | `tools/wake_state.py` |
 | Cron scheduler (tick, delivery) | `cron/scheduler.py` |
 | Cron job CRUD | `cron/jobs.py` |
+| Pre-run script (thread + reminders) | `scripts/wake_cycle_pre.py` |
+| Force-sleep backstop | `scripts/wake_cycle_force_sleep.py` |
 | Self-continue (autonomous mode) | `tools/continuation.py` |
 | Gateway base (session handling) | `gateway/platforms/base.py` |
