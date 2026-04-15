@@ -15,7 +15,6 @@ the job's origin.thread_id here ensures delivery goes to the right thread.
 import json
 import os
 import sys
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -44,46 +43,96 @@ def _save_state(state: dict):
 
 
 def _create_discord_thread(channel_id: str, name: str) -> str | None:
-    """Create a public Discord thread via REST API.  Returns thread ID or None."""
+    """Create a public Discord thread via discord.py client.  Returns thread ID or None.
+
+    Uses a short-lived discord.py client (websocket) because the VPS is
+    blocked from Discord's REST API by Cloudflare.  The client connects,
+    creates the thread, and disconnects.
+    """
+    import asyncio
+    try:
+        import discord
+    except ImportError:
+        print("(discord.py not installed)", file=sys.stderr)
+        return None
+
     token = os.getenv("DISCORD_BOT_TOKEN", "")
     if not token or not channel_id:
         return None
-    url = f"https://discord.com/api/v10/channels/{channel_id}/threads"
-    data = json.dumps({
-        "name": name[:100],
-        "type": 11,  # PUBLIC_THREAD
-        "auto_archive_duration": 1440,
-    }).encode()
-    req = urllib.request.Request(
-        url, data=data,
-        headers={
-            "Authorization": f"Bot {token}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            result = json.loads(resp.read())
-            return result.get("id")
-    except Exception as e:
-        print(f"(thread creation failed: {e})", file=sys.stderr)
-        return None
+
+    result_id = None
+
+    async def _run():
+        nonlocal result_id
+        intents = discord.Intents.default()
+        client = discord.Client(intents=intents)
+
+        @client.event
+        async def on_ready():
+            nonlocal result_id
+            try:
+                ch = client.get_channel(int(channel_id))
+                if ch is None:
+                    ch = await client.fetch_channel(int(channel_id))
+                thread = await ch.create_thread(
+                    name=name[:100],
+                    auto_archive_duration=1440,
+                )
+                result_id = str(thread.id)
+            except Exception as e:
+                print(f"(thread creation failed: {e})", file=sys.stderr)
+            finally:
+                await client.close()
+
+        try:
+            await asyncio.wait_for(client.start(token), timeout=30)
+        except asyncio.TimeoutError:
+            print("(discord client timed out)", file=sys.stderr)
+        except Exception:
+            pass  # client.close() raises on normal shutdown
+
+    asyncio.run(_run())
+    return result_id
 
 
 def _check_thread_exists(thread_id: str) -> bool:
-    """Check if a Discord thread exists and is not archived."""
+    """Check if a Discord thread exists and is not archived via discord.py."""
+    import asyncio
+    try:
+        import discord
+    except ImportError:
+        return False
+
     token = os.getenv("DISCORD_BOT_TOKEN", "")
     if not token or not thread_id:
         return False
-    url = f"https://discord.com/api/v10/channels/{thread_id}"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bot {token}"})
-    try:
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read())
-            metadata = data.get("thread_metadata", {})
-            return not metadata.get("archived", False)
-    except Exception:
-        return False
+
+    exists = False
+
+    async def _run():
+        nonlocal exists
+        intents = discord.Intents.default()
+        client = discord.Client(intents=intents)
+
+        @client.event
+        async def on_ready():
+            nonlocal exists
+            try:
+                ch = await client.fetch_channel(int(thread_id))
+                if isinstance(ch, discord.Thread) and not ch.archived:
+                    exists = True
+            except Exception:
+                pass
+            finally:
+                await client.close()
+
+        try:
+            await asyncio.wait_for(client.start(token), timeout=15)
+        except Exception:
+            pass
+
+    asyncio.run(_run())
+    return exists
 
 
 def _update_wake_cycle_job_origin(thread_id: str, chat_id: str):
@@ -91,7 +140,9 @@ def _update_wake_cycle_job_origin(thread_id: str, chat_id: str):
     try:
         if not JOBS_FILE.exists():
             return
-        jobs = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+        data = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+        # Jobs file is {"jobs": [...]} or bare [...]
+        jobs = data.get("jobs", data) if isinstance(data, dict) else data
         for job in jobs:
             if job.get("name") == "wake-cycle":
                 if not job.get("origin"):
@@ -99,10 +150,9 @@ def _update_wake_cycle_job_origin(thread_id: str, chat_id: str):
                 job["origin"]["thread_id"] = thread_id
                 job["origin"]["chat_id"] = chat_id
                 job["origin"]["platform"] = "discord"
-                # Ensure deliver is "origin" so thread_id is used
                 job["deliver"] = "origin"
                 break
-        JOBS_FILE.write_text(json.dumps(jobs, indent=2), encoding="utf-8")
+        JOBS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except Exception as e:
         print(f"(job origin update failed: {e})", file=sys.stderr)
 
@@ -167,9 +217,34 @@ def _schedule_reminders(thread_id: str | None, chat_id: str):
 # Main
 # ---------------------------------------------------------------------------
 
+def _get_home_channel() -> str:
+    """Resolve DISCORD_HOME_CHANNEL from env or config.yaml."""
+    val = os.getenv("DISCORD_HOME_CHANNEL", "")
+    if val:
+        return val
+    try:
+        import yaml
+        cfg_path = Path.home() / ".hermes" / "config.yaml"
+        if cfg_path.exists():
+            cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+            return str(cfg.get("DISCORD_HOME_CHANNEL", ""))
+    except Exception:
+        pass
+    return ""
+
+
 def main():
+    # Load .env so DISCORD_BOT_TOKEN is available
+    try:
+        from dotenv import load_dotenv
+        env_path = Path("/opt/hermes-serendipity/.env")
+        if env_path.exists():
+            load_dotenv(str(env_path), override=False)
+    except ImportError:
+        pass
+
     state = _load_state()
-    home_channel = os.getenv("DISCORD_HOME_CHANNEL", "")
+    home_channel = _get_home_channel()
     now_utc = datetime.now(timezone.utc)
 
     # --- Determine if this is a fresh wake or a mid-day cycle ---
